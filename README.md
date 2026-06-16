@@ -113,14 +113,14 @@ approval lifts plan mode's read-only gate.
 
 ### 3. Mandatory plan review (`refine`), then build
 
-Now out of read-only mode, Claude copies the approved plan to `runs/<runId>/PLAN.md` and runs the
-**mandatory `phase:"refine"`** pass — an independent critic greps your repo, verifies the plan
-against real code, and returns gaps + questions (`PLAN-REVIEW.md`). Claude fixes the gaps and relays
-any blocking questions to you *before building*. Then it runs **`phase:"build"`** with the same
-`runId`, so `PLAN.md`, `PLAN-REVIEW.md`, and the build state live together under one `runs/<runId>/`.
-(Refine runs here, after approval, because plan mode is read-only and refine writes — it is never run
-inside plan mode.) One feature is roughly **250–350k tokens** and a few minutes. Claude drives the
-`Workflow` tool; you watch progress (`/workflows`) and review the result.
+Now out of read-only mode, Claude runs the **mandatory `phase:"refine"`** pass with `planPath`
+pointing straight at the approved plan-mode file (`~/.claude/plans/<name>.md` — no copy) — an
+independent critic greps your repo, verifies the plan against real code, and returns gaps + questions
+(`PLAN-REVIEW.md`, written under `runs/<runId>/`). Claude fixes the gaps and relays any blocking
+questions to you *before building*. Then it runs **`phase:"build"`** with the same `runId` and the
+same `planPath`. (Refine runs here, after approval, because plan mode is read-only and refine writes
+— it is never run inside plan mode.) One feature is roughly **250–350k tokens** and a few minutes.
+Claude drives the `Workflow` tool; you watch progress (`/workflows`) and review the result.
 
 ---
 
@@ -158,7 +158,7 @@ satisfied: commit.
 |------|:--:|---------|
 | `phase` |  | `"refine"` (review the plan, stop) or `"build"` (implement it). Default `"build"`. Run `refine` FIRST (it's required), then `build` — reuse the same `runId` for both. |
 | `runId` | ✓ | names the state dir `runs/<runId>/`; reuse the SAME id for the `refine` and `build` phases of one feature |
-| `plan` / `planPath` | ✓ | the approved plan: inline markdown (`plan`) or a file path (`planPath`). One is required. |
+| `plan` / `planPath` | ✓ | the approved plan: inline markdown (`plan`) or a file path (`planPath`). One is required. `planPath` is normally the plan-mode file itself — its **full absolute path** (`~` is not expanded), e.g. `C:/Users/you/.claude/plans/<name>.md`. No copy needed. |
 | `target` | ✓ | `{ repo, lang, framework }` — `repo` is the target git repo |
 | `gates` | ✓ | `{ build, test, testSetup }` — your stack's commands |
 | `root` |  | where state is written + base for relative paths; auto-detected from cwd if omitted |

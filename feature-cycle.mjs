@@ -1,7 +1,7 @@
 export const meta = {
   name: 'feature-cycle',
   description: 'Plan-driven feature build: implement ONE bounded feature from an approved plan → develop+test → adversarial diff review → triage → verify acceptance, looped per round until done, blocked, or flagged',
-  whenToUse: 'Build ONE bounded, mostly-additive, NON-TRIVIAL feature (~10–100+ LoC: a new MCP tool/API endpoint/page/form, a contained enhancement, a design-needing bugfix) integrated into an existing codebase. NOT for one-line/trivial changes (make those directly — too small for a plan is too small for this) and NOT for breadth-spanning migrations/upgrades/refactors (use upgrade-cycle). The orchestrating agent authors the plan in PLAN MODE (EnterPlanMode → plan mode\'s own ~/.claude/plans/<name>.md file), the user approves it (ExitPlanMode), then the agent copies it to runs/<runId>/PLAN.md and runs the MANDATORY phase:"refine" (adversarial plan review vs the real repo — it runs AFTER approval, not inside read-only plan mode), folds in the gaps, and runs phase:"build" (reuse the same runId throughout).',
+  whenToUse: 'Build ONE bounded, mostly-additive, NON-TRIVIAL feature (~10–100+ LoC: a new MCP tool/API endpoint/page/form, a contained enhancement, a design-needing bugfix) integrated into an existing codebase. NOT for one-line/trivial changes (make those directly — too small for a plan is too small for this) and NOT for breadth-spanning migrations/upgrades/refactors (use upgrade-cycle). The orchestrating agent authors the plan in PLAN MODE (EnterPlanMode → plan mode\'s own ~/.claude/plans/<name>.md file), the user approves it (ExitPlanMode), then the agent runs the MANDATORY phase:"refine" with planPath = that plan-mode file\'s full absolute path (no copy; abs() does not expand ~) — adversarial plan review vs the real repo, run AFTER approval, NOT inside read-only plan mode — folds in the gaps, and runs phase:"build" (reuse the same runId + planPath throughout).',
   phases: [
     { title: 'Refine', detail: 'MANDATORY first pass: an independent critic greps the repo, verifies the plan against real code, and flags gaps + blocking questions (refine phase only)' },
     { title: 'Load', detail: 'Parse the approved plan + read prior progress (resume)' },
@@ -17,10 +17,11 @@ export const meta = {
 // Config — everything app/feature-specific arrives via args so the engine stays general.
 // The PLAN is produced OUTSIDE this engine: the orchestrating agent authors it in PLAN MODE
 // (EnterPlanMode → writes it into plan mode's own ~/.claude/plans/<name>.md) → the user approves
-// (ExitPlanMode, which lifts read-only) → the agent copies it to runs/<runId>/PLAN.md and runs
-// phase:"refine" (the MANDATORY plan review; it writes, so it CANNOT run inside read-only plan mode)
-// → folds in the gaps/answers → phase:"build" implements it, reusing the same runId. This engine
-// CONSUMES that plan; it does not decompose or discover a goal.
+// (ExitPlanMode, which lifts read-only) → the agent runs phase:"refine" with planPath pointing at
+// that plan-mode file directly (no copy; pass its FULL absolute path — abs() does not expand ~). It
+// is the MANDATORY plan review; it writes, so it CANNOT run inside read-only plan mode → folds in the
+// gaps/answers → phase:"build" implements it, reusing the same runId + planPath. This engine CONSUMES
+// that plan; it does not decompose or discover a goal.
 // =============================================================================
 const A = typeof args === 'string' ? JSON.parse(args) : args;
 if (!A || !A.runId || !(A.planPath || (A.plan && typeof A.plan !== 'object'))) {
@@ -673,10 +674,10 @@ if (PHASE === 'refine') {
     questions,
     planReviewFile: `${STATE_DIR}/PLAN-REVIEW.md`,
     nextStep: questions.length
-      ? 'Relay the questions to the user (AskUserQuestion), fold the answers + gap fixes into runs/<runId>/PLAN.md, then re-invoke phase:"build" with this SAME runId. (The user already approved via ExitPlanMode before this refine ran; just flag any material changes.)'
+      ? 'Relay the questions to the user (AskUserQuestion), fold the answers + gap fixes directly into the plan file (planPath), then re-invoke phase:"build" with this SAME runId + planPath. (The user already approved via ExitPlanMode before this refine ran; just flag any material changes.)'
       : gaps.length
-        ? 'Fold the gap fixes into runs/<runId>/PLAN.md (flag any material change to the user), then re-invoke phase:"build" with this SAME runId.'
-        : 'Plan is sound — re-invoke phase:"build" with this SAME runId.',
+        ? 'Fold the gap fixes directly into the plan file (planPath) (flag any material change to the user), then re-invoke phase:"build" with this SAME runId + planPath.'
+        : 'Plan is sound — re-invoke phase:"build" with this SAME runId + planPath.',
   };
 }
 
