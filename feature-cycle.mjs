@@ -1,9 +1,9 @@
 export const meta = {
   name: 'feature-cycle',
   description: 'Plan-driven feature build: implement ONE bounded feature from an approved plan → develop+test → adversarial diff review → triage → verify acceptance, looped per round until done, blocked, or flagged',
-  whenToUse: 'Build ONE bounded, mostly-additive feature (a new endpoint/component/MCP tool, a contained enhancement, a design-needing bugfix) from a plan you already approved. Breadth-spanning migrations/upgrades/refactors belong in upgrade-cycle instead. Optional phase:"refine" adversarially reviews the plan first; phase:"build" implements it. The plan is authored by the orchestrating agent in PLAN MODE and approved by the user BEFORE build runs.',
+  whenToUse: 'Build ONE bounded, mostly-additive, NON-TRIVIAL feature (~10–100+ LoC: a new MCP tool/API endpoint/page/form, a contained enhancement, a design-needing bugfix) integrated into an existing codebase. NOT for one-line/trivial changes (make those directly — too small for a plan is too small for this) and NOT for breadth-spanning migrations/upgrades/refactors (use upgrade-cycle). The orchestrating agent authors the plan in PLAN MODE (EnterPlanMode) and writes it to runs/<runId>/PLAN.md. phase:"refine" is the MANDATORY first pass — it adversarially reviews the plan against the real repo; then phase:"build" implements it (reuse the same runId). The user approves the refined plan (ExitPlanMode) BEFORE build runs.',
   phases: [
-    { title: 'Refine', detail: 'Optional: an independent critic greps the repo, verifies the plan against real code, and flags gaps + blocking questions (refine phase only)' },
+    { title: 'Refine', detail: 'MANDATORY first pass: an independent critic greps the repo, verifies the plan against real code, and flags gaps + blocking questions (refine phase only)' },
     { title: 'Load', detail: 'Parse the approved plan + read prior progress (resume)' },
     { title: 'Develop', detail: 'Developer implements the plan minimally, writes/runs tests + any frontend/MCP/curl verification, leaves changes UNSTAGED' },
     { title: 'Review', detail: 'Adversarial reviewer reads ONLY the unstaged diff + the acceptance criteria — deliberately BLIND to the plan steps, so it judges the code on its own merits' },
@@ -15,8 +15,10 @@ export const meta = {
 
 // =============================================================================
 // Config — everything app/feature-specific arrives via args so the engine stays general.
-// The PLAN is produced OUTSIDE this engine (the orchestrating agent authors it in plan mode and
-// the user approves it). This engine consumes that plan; it does not decompose or discover a goal.
+// The PLAN is produced OUTSIDE this engine: the orchestrating agent authors it in PLAN MODE
+// (EnterPlanMode) → writes runs/<runId>/PLAN.md → runs phase:"refine" (the MANDATORY plan review) →
+// folds in the gaps/answers → the user approves (ExitPlanMode) → phase:"build" implements it, reusing
+// the same runId. This engine CONSUMES that plan; it does not decompose or discover a goal.
 // =============================================================================
 const A = typeof args === 'string' ? JSON.parse(args) : args;
 if (!A || !A.runId || !(A.planPath || (A.plan && typeof A.plan !== 'object'))) {
@@ -134,6 +136,7 @@ const LOADER_SCHEMA = {
     plan: PLAN_SHAPE,
     done: { type: 'object', properties: { status: { type: 'string', description: 'prior progress status, or "" if none' } } },
     plan_missing: { type: 'boolean', description: 'true if no plan text/file could be read' },
+    plan_review_exists: { type: 'boolean', description: 'true if a PLAN-REVIEW.md (output of the mandatory refine phase) already exists in the state dir' },
   },
 };
 
@@ -405,6 +408,8 @@ ${PLAN_PATH ? `   • Read the plan file at ${PLAN_PATH}.` : ''}${PLAN_INLINE ? 
      Do NOT invent steps — if steps are missing, leave steps=[] (the developer will implement the
      acceptance criteria).
 3. Read ${STATE_DIR}/progress.json if it exists → return its status as done.status (else "").
+4. Check whether ${STATE_DIR}/PLAN-REVIEW.md exists → set plan_review_exists (true/false). This is the
+   artifact the MANDATORY refine phase writes; the conductor uses it to confirm the plan was reviewed.
 Do NOT modify anything. Return via the schema.`;
 
 const refinePrompt = () => `
@@ -666,10 +671,10 @@ if (PHASE === 'refine') {
     questions,
     planReviewFile: `${STATE_DIR}/PLAN-REVIEW.md`,
     nextStep: questions.length
-      ? 'Relay the questions to the user, fold answers + gap fixes into the plan, then re-invoke phase:"build".'
+      ? 'Relay the questions to the user (AskUserQuestion), fold the answers + gap fixes into runs/<runId>/PLAN.md, then ExitPlanMode for approval and re-invoke phase:"build" with this SAME runId.'
       : gaps.length
-        ? 'Fold the gap fixes into the plan (confirm with the user), then re-invoke phase:"build".'
-        : 'Plan is sound — get the user\'s approval, then re-invoke phase:"build".',
+        ? 'Fold the gap fixes into runs/<runId>/PLAN.md (confirm with the user), then ExitPlanMode for approval and re-invoke phase:"build" with this SAME runId.'
+        : 'Plan is sound — ExitPlanMode to get the user\'s approval, then re-invoke phase:"build" with this SAME runId.',
   };
 }
 
@@ -693,6 +698,14 @@ if (priorStatus.startsWith('done')) {
 const tstrat = plan.test_strategy ?? { kind: 'none' };
 const gate = plan.gate ?? 'green';
 log(`build: "${plan.feature.slice(0, 80)}${plan.feature.length > 80 ? '…' : ''}" → ${REPO} [gate=${gate}, verify=${tstrat.method || tstrat.kind}]`);
+
+// The refine phase is MANDATORY and leaves PLAN-REVIEW.md in the state dir. On a FRESH run (no prior
+// progress) with no such artifact, the plan was very likely built without the required review — warn
+// loudly (non-blocking; resumes keep the artifact, and an inline-plan caller may have reviewed it out
+// of band). Run phase:"refine" with this SAME runId first to satisfy it.
+if (!priorStatus && loaded?.plan_review_exists !== true) {
+  log(`  ⚠ no PLAN-REVIEW.md in ${STATE_DIR} — the MANDATORY refine pass appears to have been skipped. Run phase:"refine" with this same runId BEFORE build (see CLAUDE.md → canonical flow).`);
+}
 
 // One-time baseline prep: fold any pre-existing modified TRACKED files into the staged baseline so
 // the feature's UNSTAGED diff is purely this feature's work (keeps the reviewer's git-diff clean).

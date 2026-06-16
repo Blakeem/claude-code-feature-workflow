@@ -3,12 +3,25 @@
 **An autonomous workflow for Claude Code that builds ONE bounded feature from a plan you approve —
 safely, test-verified, wired-in, and mostly unattended.**
 
-You (with Claude) write a short plan for a single feature — a new MCP tool, an API endpoint, a UI
-component, a contained enhancement, or a design-needing bugfix. Claude can adversarially review that
-plan against your real repo first. You approve it. Then the workflow drives the feature through a
-**develop → review → triage** loop until it's implemented, tested, *actually wired in*, and
-production-safe — pausing only when it genuinely needs your decision — and finishes with an
-**acceptance check** against your criteria.
+You (with Claude) write a short plan for a single feature — a new MCP tool, an API endpoint, a new
+page or form, a contained enhancement, or a design-needing bugfix. Claude **adversarially reviews
+that plan against your real repo** (a required step), folds in the gaps, and you approve it. Then the
+workflow drives the feature through a **develop → review → triage** loop until it's implemented,
+tested, *actually wired in*, and production-safe — pausing only when it genuinely needs your decision
+— and finishes with an **acceptance check** against your criteria.
+
+### Is this the right tool? (scope)
+
+The workflow has real overhead — plan mode, a mandatory plan review, and a multi-round build loop
+(≈ 250–350k tokens). It's worth it only for a feature **big enough to deserve a written plan**:
+
+- ✅ **Right size:** one bounded feature, roughly **10–100+ lines**, integrated into an existing
+  codebase — a new MCP tool, API endpoint, page, form, or similarly-scoped enhancement / bugfix.
+- ❌ **Too small** (one-line change, rename, config flip): skip the workflow and just make the edit.
+  If it's too small to review a plan for, it's too small for this.
+- ❌ **Too big** (migration, version upgrade, framework port, broad refactor across many files): use
+  the sibling [`upgrade-cycle`](https://github.com/Blakeem/claude-code-upgrade-workflow), or split it
+  and run this once per bounded feature.
 
 It is **one file** (`feature-cycle.mjs`) plus a plan and a small config. Everything project- and
 stack-specific lives in the config; the engine itself knows nothing about your language or framework.
@@ -25,8 +38,10 @@ stack-specific lives in the config; the engine itself knows nothing about your l
 The smart part — discovery, writing the spec, and the human approval gate — happens **outside the
 engine**, in Claude Code's native **plan mode**, which Anthropic keeps current. Claude explores your
 code, asks you the decisions that matter (acceptance criteria; whether the feature wants unit/TDD
-tests or a frontend verification method like Chrome DevTools MCP), and writes a plan. The engine
-*consumes* that approved plan and builds it. No worse, home-grown spec engine to maintain.
+tests or a frontend verification method like Chrome DevTools MCP), and writes a plan to
+`runs/<runId>/PLAN.md`. That plan then goes through the engine's **mandatory `refine` pass** — an
+independent critic that greps your repo and flags gaps + questions — before you approve it. Only then
+does the engine *consume* the approved plan and build it. No worse, home-grown spec engine to maintain.
 
 A Workflow runs unattended and **can't ask you questions mid-run**, so anything needing a human
 answer is settled before the build — by Claude, interactively, while writing/refining the plan.
@@ -86,19 +101,22 @@ The Workflow tool only activates when you opt in, so include **“workflow”** 
 > "Use the feature-cycle **workflow** in `~/tools/feature-cycle` to add a `search_docs` MCP tool to
 > `~/work/my-mcp-server`. Plan it first so I can approve it."
 
-### 2. Claude writes the plan (plan mode) — you approve it
+### 2. Claude writes the plan (plan mode), reviews it, then you approve
 
-Claude enters plan mode, explores your repo, asks you the up-front decisions (acceptance criteria,
-testing approach), and drafts a plan in the standard shape (`## Feature / ## Acceptance Criteria /
-## Integration Points / ## Implementation Steps / ## Files / ## Test Strategy / ## Gate`). For a
-non-trivial feature it can run **`phase:"refine"`** first — an independent critic greps your repo,
-verifies the plan, and returns gaps + questions (`PLAN-REVIEW.md`). You approve the final plan.
+Claude enters **plan mode**, explores your repo, asks you the up-front decisions (acceptance
+criteria, testing approach), and drafts a plan in the standard shape (`## Feature / ## Acceptance
+Criteria / ## Integration Points / ## Implementation Steps / ## Files / ## Test Strategy / ## Gate`)
+to `runs/<runId>/PLAN.md`. It then runs the **mandatory `phase:"refine"`** pass — an independent
+critic greps your repo, verifies the plan against real code, and returns gaps + questions
+(`PLAN-REVIEW.md`). Claude fixes the gaps, relays any questions to you, and presents the refined plan
+for your approval.
 
 ### 3. Build
 
-Claude runs **`phase:"build"`** with the approved plan. One feature is roughly **250–350k tokens**
-and a few minutes. Claude drives the `Workflow` tool; you watch progress (`/workflows`) and review
-the result.
+Claude runs **`phase:"build"`** with the approved plan, **reusing the same `runId`** as the refine
+pass so `PLAN.md`, `PLAN-REVIEW.md`, and the build state live together under one `runs/<runId>/`. One
+feature is roughly **250–350k tokens** and a few minutes. Claude drives the `Workflow` tool; you
+watch progress (`/workflows`) and review the result.
 
 ---
 
@@ -134,8 +152,8 @@ satisfied: commit.
 
 | field | required | meaning |
 |------|:--:|---------|
-| `phase` |  | `"refine"` (review the plan, stop) or `"build"` (implement it). Default `"build"`. |
-| `runId` | ✓ | names the state dir `runs/<runId>/` |
+| `phase` |  | `"refine"` (review the plan, stop) or `"build"` (implement it). Default `"build"`. Run `refine` FIRST (it's required), then `build` — reuse the same `runId` for both. |
+| `runId` | ✓ | names the state dir `runs/<runId>/`; reuse the SAME id for the `refine` and `build` phases of one feature |
 | `plan` / `planPath` | ✓ | the approved plan: inline markdown (`plan`) or a file path (`planPath`). One is required. |
 | `target` | ✓ | `{ repo, lang, framework }` — `repo` is the target git repo |
 | `gates` | ✓ | `{ build, test, testSetup }` — your stack's commands |

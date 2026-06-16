@@ -1,14 +1,48 @@
 # feature-cycle — operator guide (for Claude)
 
 This repo is a **single self-contained Claude Code Workflow** (`feature-cycle.mjs`) that builds
-**ONE bounded feature** — a new endpoint/component/MCP tool, a contained enhancement, or a
+**ONE bounded feature** — a new MCP tool, API endpoint, page, form, a contained enhancement, or a
 design-needing bugfix — from a plan **you (the orchestrating agent) author and the user approves**,
 driving it to a production-ready, test-green, *wired-in* state across one target git repo.
 
-Your job when a user invokes this: decide whether the feature even needs the plan front-end,
-**author the plan in plan mode** (asking the up-front decisions), optionally have the engine
-adversarially review it, get the user's approval, run the build, then **verify ground truth
-yourself**. Below is what is NOT obvious from the prompts inside the engine.
+## Scope — is this the right tool? (check FIRST)
+
+This workflow carries real overhead (plan mode + a mandatory plan review + a develop→review→triage
+loop ≈ 250–350k tokens). It only pays off for a feature **big enough to deserve a written plan and a
+review of that plan.** Use this band:
+
+- ✅ **Right size:** one bounded feature, roughly **10–100+ lines** depending on complexity, that
+  integrates into an existing codebase — a **new MCP tool, a new API endpoint, a new page, a new
+  form,** or a similarly-scoped enhancement / design-needing bugfix.
+- ❌ **Too small:** a one-line change, a tiny tweak, a rename, a config flip. If it's too small to be
+  worth reviewing a plan, it's too small for plan mode AND too small for this workflow — **just make
+  the edit directly.** Don't spin up the workflow for it.
+- ❌ **Too big:** a breadth-spanning migration, version upgrade, framework port, or subsystem refactor
+  across many files — that's the sibling **`upgrade-cycle`**. If it's really several features, run
+  this once per bounded feature.
+
+When a request lands at the trivial or breadth-spanning end, say so and steer the user to the direct
+edit or to `upgrade-cycle` instead of forcing it through here.
+
+## The canonical flow (memorize this — it is the whole job)
+
+All the user needs to say is *what to build* + *where this workflow lives*. You then drive, in order:
+
+1. **`EnterPlanMode`** — explore the target repo, and `AskUserQuestion` for anything ambiguous
+   (acceptance criteria + testing approach are the must-asks).
+2. **Write the first-draft plan** to `runs/<runId>/PLAN.md` (beside this tool, gitignored — NOT a
+   `plans/` folder, NOT inside the target repo). Use the standard section shape (below). Pick a
+   `runId` now and reuse it for every phase.
+3. **`Workflow` `phase:"refine"`** (MANDATORY — same `runId`, same `planPath`). The engine's opus Plan
+   Critic greps the real repo and returns `gaps` / `questions` / `too_big`, writing `PLAN-REVIEW.md`.
+4. **Fold the feedback in:** fix every gap in `runs/<runId>/PLAN.md`; relay each question to the user
+   with `AskUserQuestion` and fold the answers in. (If `too_big:true`, split or hand to `upgrade-cycle`.)
+5. **`ExitPlanMode`** — present the refined plan; the user approves.
+6. **`Workflow` `phase:"build"`** (same `runId`, same `planPath`) — the develop→review→triage→verify loop.
+7. **Verify ground truth YOURSELF** (see below), read `ACCEPTANCE.md`, surface `NEEDS-DECISION.md`,
+   tell the user what to review. **Never commit.**
+
+Below is what is NOT obvious from the prompts inside the engine.
 
 ## The division of labour that makes this work
 
@@ -25,24 +59,29 @@ that needs a human answer is YOUR job, done interactively before/around the run:
   - Backend / API / MCP tool / data logic → **unit tests** (often TDD: write failing tests first).
   - Frontend → usually **not** unit tests; decide the verification method *with the user*: Chrome
     DevTools MCP, MCP inspector, Playwright, manual `curl` against a running server, or none.
-- **Relay the engine's questions.** If `phase:"refine"` returns questions, ask the user, fold the
-  answers into the plan, and only then run `phase:"build"`.
+- **Run the plan review, every time.** `phase:"refine"` is a MANDATORY stage, not an optional one —
+  the whole reason this workflow exists is to review a real plan before building it. If refine returns
+  questions, ask the user, fold the answers into the plan; if it returns gaps, fix them; only then run
+  `phase:"build"`. (If a feature is too small to be worth this review, it's too small for the workflow
+  — see **Scope** above.)
 
 ## The orchestrating-agent protocol (do this)
 
-1. **Read the request.** If it's a genuinely large or breadth-spanning change, stop — that's
-   `upgrade-cycle`'s job, not this one. This engine is for ONE bounded feature (~1–6 files, one
-   develop pass). If it's clearly more, tell the user to split it into multiple runs.
-2. **Enter plan mode** (`EnterPlanMode`). Explore the codebase, and if anything material is
-   ambiguous, ask the user (`AskUserQuestion`) — especially acceptance criteria and the testing
-   approach. Author the plan in the **standard shape** (below).
-3. **(Optional) Adversarial plan review.** For non-trivial features, save the plan to a file and run
-   `Workflow` with `phase:"refine"`. It greps the real repo, verifies your file list + integration
-   points, and returns `gaps`/`questions`/`too_big` + writes `PLAN-REVIEW.md`. Relay questions to the
-   user, fix the gaps in the plan. **Skip refine for small, obvious features** ("add a dark-mode
-   toggle") — the in-loop review will catch anything small.
-4. **Get approval.** Present the (refined) plan and `ExitPlanMode`. The user approves.
-5. **Build.** Run `Workflow` with `phase:"build"` and the approved plan (`planPath` or inline `plan`).
+1. **Read the request and size it (see Scope above).** If it's trivial (a one-liner / tiny tweak),
+   DON'T use this workflow — just make the edit directly. If it's large or breadth-spanning, that's
+   `upgrade-cycle`'s job; if it's really several features, tell the user to split it. This engine is
+   for ONE bounded, non-trivial feature (~10–100+ LoC, ~1–6 files, one develop pass). Pick a `runId`
+   now and reuse it for refine AND build.
+2. **`EnterPlanMode`.** Explore the codebase, and if anything material is ambiguous, ask the user
+   (`AskUserQuestion`) — especially acceptance criteria and the testing approach. Author the plan in
+   the **standard shape** (below) and write it to `runs/<runId>/PLAN.md` (beside this tool, gitignored
+   — never a `plans/` folder, never inside the target repo).
+3. **Adversarial plan review (MANDATORY).** Run `Workflow` with `phase:"refine"` (same `runId`, same
+   `planPath`). It greps the real repo, verifies your file list + integration points, and returns
+   `gaps`/`questions`/`too_big` + writes `runs/<runId>/PLAN-REVIEW.md`. Relay every question to the
+   user, fix every gap in `runs/<runId>/PLAN.md`. (If `too_big:true` → split or hand to `upgrade-cycle`.)
+4. **Get approval.** Present the refined plan and `ExitPlanMode`. The user approves.
+5. **Build.** Run `Workflow` with `phase:"build"` and the approved plan (same `runId`, `planPath`).
    The plan's own final step should literally be *"invoke feature-cycle phase:build with this plan
    file"* — so approval flows straight into execution.
 6. **Verify ground truth YOURSELF** (see below), read `ACCEPTANCE.md`, surface anything in
@@ -119,9 +158,12 @@ sequences them. (`upgrade-cycle`'s separate Research role is gone — discovery 
 
 ## Running it — the playbook
 
-1. **Author + approve the plan** (plan mode). Optionally `phase:"refine"` first.
-2. **`phase:"build"`.** Pass `runId`, `target.repo`, `gates`, and `planPath` (best — beside the tool,
-   gitignored) **or** inline `plan` text. `root` is auto-detected from `pwd` if omitted; BEST
+1. **Author the plan** (`EnterPlanMode` → `runs/<runId>/PLAN.md`), **run `phase:"refine"` (mandatory,
+   same `runId`)**, fold in its gaps/questions, then `ExitPlanMode` for the user's approval.
+2. **`phase:"build"`.** Pass the SAME `runId` you used for refine, plus `target.repo`, `gates`, and
+   `planPath` (best — beside the tool, gitignored) **or** inline `plan` text. Reusing the `runId` keeps
+   `PLAN.md`, `PLAN-REVIEW.md`, and the build state together under one `runs/<runId>/`.
+   `root` is auto-detected from `pwd` if omitted; BEST
    PRACTICE: pass the tool's own directory (the `scriptPath` the Workflow result echoes) as `root` so
    run-state lands beside the tool, not inside the target repo. One feature ≈ 250–350k tokens.
 3. **Verify ground truth YOURSELF — do not trust the ledger blindly.** Run the gates in the real
