@@ -2,7 +2,7 @@
   "phase": "build",
   "runId": "myproject-feature",
   "planPath": "runs/myproject-feature/PLAN.md",
-  "plan": "(Set EITHER planPath OR plan, not both — if both are present, planPath wins. ALTERNATIVE to planPath: paste the approved plan markdown here as a string. The orchestrating agent authors the plan in PLAN MODE (EnterPlanMode), writes it to runs/<runId>/PLAN.md, then runs the MANDATORY phase:\"refine\" with this SAME runId before phase:\"build\". See CLAUDE.md for the canonical flow + the section shape: ## Feature / ## Acceptance Criteria / ## Integration Points / ## Implementation Steps / ## Files / ## Test Strategy / ## Gate.)",
+  "plan": "(Set EITHER planPath OR plan, not both — if both are present, planPath wins. ALTERNATIVE to planPath: paste the approved plan markdown here as a string. Flow: the orchestrating agent authors the plan in PLAN MODE (EnterPlanMode → plan mode's own ~/.claude/plans/<name>.md), the user approves it (ExitPlanMode), then the agent copies it to runs/<runId>/PLAN.md and runs the MANDATORY phase:\"refine\" (after approval — it writes, so it can't run inside read-only plan mode) before phase:\"build\", reusing this SAME runId throughout. See CLAUDE.md for the canonical flow + the section shape: ## Feature / ## Acceptance Criteria / ## Integration Points / ## Implementation Steps / ## Files / ## Test Strategy / ## Gate.)",
   "target": { "repo": "/ABSOLUTE/PATH/TO/TARGET/GIT/REPO", "lang": "ts", "framework": "describe-it" },
   "reference": "",
   "conventions": "Coding conventions the reviewer judges against: language/version constraints, what stays additive, style, and what NOT to touch (legacy business logic).",

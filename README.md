@@ -4,11 +4,12 @@
 safely, test-verified, wired-in, and mostly unattended.**
 
 You (with Claude) write a short plan for a single feature — a new MCP tool, an API endpoint, a new
-page or form, a contained enhancement, or a design-needing bugfix. Claude **adversarially reviews
-that plan against your real repo** (a required step), folds in the gaps, and you approve it. Then the
-workflow drives the feature through a **develop → review → triage** loop until it's implemented,
-tested, *actually wired in*, and production-safe — pausing only when it genuinely needs your decision
-— and finishes with an **acceptance check** against your criteria.
+page or form, a contained enhancement, or a design-needing bugfix — in plan mode, and **you approve
+it**. Claude then **adversarially reviews that plan against your real repo** (a required step) and
+folds in the gaps before building. Then the workflow drives the feature through a **develop → review
+→ triage** loop until it's implemented, tested, *actually wired in*, and production-safe — pausing
+only when it genuinely needs your decision — and finishes with an **acceptance check** against your
+criteria.
 
 ### Is this the right tool? (scope)
 
@@ -38,10 +39,11 @@ stack-specific lives in the config; the engine itself knows nothing about your l
 The smart part — discovery, writing the spec, and the human approval gate — happens **outside the
 engine**, in Claude Code's native **plan mode**, which Anthropic keeps current. Claude explores your
 code, asks you the decisions that matter (acceptance criteria; whether the feature wants unit/TDD
-tests or a frontend verification method like Chrome DevTools MCP), and writes a plan to
-`runs/<runId>/PLAN.md`. That plan then goes through the engine's **mandatory `refine` pass** — an
-independent critic that greps your repo and flags gaps + questions — before you approve it. Only then
-does the engine *consume* the approved plan and build it. No worse, home-grown spec engine to maintain.
+tests or a frontend verification method like Chrome DevTools MCP), and writes the plan into plan
+mode's own plan file (`~/.claude/plans/<name>.md`). You approve it. Then — once plan mode's read-only
+gate is lifted — the plan goes through the engine's **mandatory `refine` pass**: an independent critic
+greps your repo, flags gaps + questions, and Claude folds them in (asking you about anything blocking)
+*before* the build runs. Only then does the engine build it. No worse, home-grown spec engine to maintain.
 
 A Workflow runs unattended and **can't ask you questions mid-run**, so anything needing a human
 answer is settled before the build — by Claude, interactively, while writing/refining the plan.
@@ -101,22 +103,24 @@ The Workflow tool only activates when you opt in, so include **“workflow”** 
 > "Use the feature-cycle **workflow** in `~/tools/feature-cycle` to add a `search_docs` MCP tool to
 > `~/work/my-mcp-server`. Plan it first so I can approve it."
 
-### 2. Claude writes the plan (plan mode), reviews it, then you approve
+### 2. Claude writes the plan (plan mode) — you approve it
 
 Claude enters **plan mode**, explores your repo, asks you the up-front decisions (acceptance
 criteria, testing approach), and drafts a plan in the standard shape (`## Feature / ## Acceptance
 Criteria / ## Integration Points / ## Implementation Steps / ## Files / ## Test Strategy / ## Gate`)
-to `runs/<runId>/PLAN.md`. It then runs the **mandatory `phase:"refine"`** pass — an independent
-critic greps your repo, verifies the plan against real code, and returns gaps + questions
-(`PLAN-REVIEW.md`). Claude fixes the gaps, relays any questions to you, and presents the refined plan
-for your approval.
+into plan mode's own plan file (`~/.claude/plans/<name>.md`). You review and approve it — that
+approval lifts plan mode's read-only gate.
 
-### 3. Build
+### 3. Mandatory plan review (`refine`), then build
 
-Claude runs **`phase:"build"`** with the approved plan, **reusing the same `runId`** as the refine
-pass so `PLAN.md`, `PLAN-REVIEW.md`, and the build state live together under one `runs/<runId>/`. One
-feature is roughly **250–350k tokens** and a few minutes. Claude drives the `Workflow` tool; you
-watch progress (`/workflows`) and review the result.
+Now out of read-only mode, Claude copies the approved plan to `runs/<runId>/PLAN.md` and runs the
+**mandatory `phase:"refine"`** pass — an independent critic greps your repo, verifies the plan
+against real code, and returns gaps + questions (`PLAN-REVIEW.md`). Claude fixes the gaps and relays
+any blocking questions to you *before building*. Then it runs **`phase:"build"`** with the same
+`runId`, so `PLAN.md`, `PLAN-REVIEW.md`, and the build state live together under one `runs/<runId>/`.
+(Refine runs here, after approval, because plan mode is read-only and refine writes — it is never run
+inside plan mode.) One feature is roughly **250–350k tokens** and a few minutes. Claude drives the
+`Workflow` tool; you watch progress (`/workflows`) and review the result.
 
 ---
 

@@ -26,21 +26,33 @@ edit or to `upgrade-cycle` instead of forcing it through here.
 
 ## The canonical flow (memorize this — it is the whole job)
 
-All the user needs to say is *what to build* + *where this workflow lives*. You then drive, in order:
+All the user needs to say is *what to build* + *where this workflow lives*. Pick a `runId` now and
+reuse it for every phase. Then drive, in order:
 
-1. **`EnterPlanMode`** — explore the target repo, and `AskUserQuestion` for anything ambiguous
-   (acceptance criteria + testing approach are the must-asks).
-2. **Write the first-draft plan** to `runs/<runId>/PLAN.md` (beside this tool, gitignored — NOT a
-   `plans/` folder, NOT inside the target repo). Use the standard section shape (below). Pick a
-   `runId` now and reuse it for every phase.
-3. **`Workflow` `phase:"refine"`** (MANDATORY — same `runId`, same `planPath`). The engine's opus Plan
-   Critic greps the real repo and returns `gaps` / `questions` / `too_big`, writing `PLAN-REVIEW.md`.
+1. **`EnterPlanMode`.** Plan mode is READ-ONLY and gives you a plan-file path in its system message
+   (`~/.claude/plans/<random-words>.md` — Anthropic's, NOT a `runs/` or `plans/` path you invent).
+   Explore the target repo (it runs Explore→Plan subagents for you), `AskUserQuestion` for anything
+   ambiguous (acceptance criteria + testing approach are the must-asks), and **write the plan, in the
+   standard section shape (below), INTO that plan-mode file** — it's the only file you may edit in
+   plan mode.
+2. **`ExitPlanMode`** — present the plan; the user approves. This is the human approval gate and it
+   leaves read-only mode (so writes/tools are allowed again).
+3. **Copy the approved plan to `runs/<runId>/PLAN.md`** (beside this tool, gitignored), then run
+   **`Workflow` `phase:"refine"`** (MANDATORY — same `runId`, `planPath` = that copy). The engine's
+   opus Plan Critic greps the real repo and returns `gaps` / `questions` / `too_big`, writing
+   `PLAN-REVIEW.md`. **Refine runs HERE, after approval — never inside plan mode** (it's a write
+   workflow; plan mode is read-only). You still gate BUILD because you act on its findings next.
 4. **Fold the feedback in:** fix every gap in `runs/<runId>/PLAN.md`; relay each question to the user
-   with `AskUserQuestion` and fold the answers in. (If `too_big:true`, split or hand to `upgrade-cycle`.)
-5. **`ExitPlanMode`** — present the refined plan; the user approves.
-6. **`Workflow` `phase:"build"`** (same `runId`, same `planPath`) — the develop→review→triage→verify loop.
-7. **Verify ground truth YOURSELF** (see below), read `ACCEPTANCE.md`, surface `NEEDS-DECISION.md`,
+   with `AskUserQuestion` and fold the answers in; if refine materially changed the plan, tell the
+   user. (If `too_big:true`, split or hand to `upgrade-cycle`.)
+5. **`Workflow` `phase:"build"`** (same `runId`, same `planPath`) — the develop→review→triage→verify loop.
+6. **Verify ground truth YOURSELF** (see below), read `ACCEPTANCE.md`, surface `NEEDS-DECISION.md`,
    tell the user what to review. **Never commit.**
+
+Why refine is step 3 and not before `ExitPlanMode`: plan mode forbids the writes `phase:"refine"`
+does (it writes `PLAN-REVIEW.md`). Running it in plan mode only "works" by exploiting that the
+read-only rule isn't hard-enforced — fragile and wrong-in-spirit. So the engine review runs once
+write perms are restored; you remain the gate before build by relaying its gaps/questions.
 
 Below is what is NOT obvious from the prompts inside the engine.
 
@@ -60,10 +72,11 @@ that needs a human answer is YOUR job, done interactively before/around the run:
   - Frontend → usually **not** unit tests; decide the verification method *with the user*: Chrome
     DevTools MCP, MCP inspector, Playwright, manual `curl` against a running server, or none.
 - **Run the plan review, every time.** `phase:"refine"` is a MANDATORY stage, not an optional one —
-  the whole reason this workflow exists is to review a real plan before building it. If refine returns
-  questions, ask the user, fold the answers into the plan; if it returns gaps, fix them; only then run
-  `phase:"build"`. (If a feature is too small to be worth this review, it's too small for the workflow
-  — see **Scope** above.)
+  the whole reason this workflow exists is to review a real plan before building it. It runs AFTER the
+  user's `ExitPlanMode` approval (plan mode is read-only; refine writes), against the
+  `runs/<runId>/PLAN.md` copy. If refine returns questions, ask the user, fold the answers into the
+  plan; if it returns gaps, fix them; only then run `phase:"build"`. (If a feature is too small to be
+  worth this review, it's too small for the workflow — see **Scope** above.)
 
 ## The orchestrating-agent protocol (do this)
 
@@ -74,16 +87,18 @@ that needs a human answer is YOUR job, done interactively before/around the run:
    now and reuse it for refine AND build.
 2. **`EnterPlanMode`.** Explore the codebase, and if anything material is ambiguous, ask the user
    (`AskUserQuestion`) — especially acceptance criteria and the testing approach. Author the plan in
-   the **standard shape** (below) and write it to `runs/<runId>/PLAN.md` (beside this tool, gitignored
-   — never a `plans/` folder, never inside the target repo).
-3. **Adversarial plan review (MANDATORY).** Run `Workflow` with `phase:"refine"` (same `runId`, same
-   `planPath`). It greps the real repo, verifies your file list + integration points, and returns
-   `gaps`/`questions`/`too_big` + writes `runs/<runId>/PLAN-REVIEW.md`. Relay every question to the
-   user, fix every gap in `runs/<runId>/PLAN.md`. (If `too_big:true` → split or hand to `upgrade-cycle`.)
-4. **Get approval.** Present the refined plan and `ExitPlanMode`. The user approves.
-5. **Build.** Run `Workflow` with `phase:"build"` and the approved plan (same `runId`, `planPath`).
-   The plan's own final step should literally be *"invoke feature-cycle phase:build with this plan
-   file"* — so approval flows straight into execution.
+   the **standard shape** (below) and write it INTO plan mode's own plan file (the
+   `~/.claude/plans/<random-words>.md` path its system message gives you — the only file you can edit
+   in plan mode; never a `plans/` folder, never `runs/<runId>/PLAN.md`, never inside the target repo).
+3. **Get approval.** `ExitPlanMode` presents that plan file; the user approves. This leaves read-only
+   mode, so you can write + run tools again.
+4. **Adversarial plan review (MANDATORY).** Copy the approved plan to `runs/<runId>/PLAN.md`, then run
+   `Workflow` with `phase:"refine"` (same `runId`, `planPath` = that copy). It greps the real repo,
+   verifies your file list + integration points, and returns `gaps`/`questions`/`too_big` + writes
+   `runs/<runId>/PLAN-REVIEW.md`. This runs AFTER approval — NOT inside plan mode (it writes; plan
+   mode is read-only). Relay every question to the user, fix every gap in `runs/<runId>/PLAN.md`, and
+   tell the user if refine materially changed the plan. (If `too_big:true` → split or hand to `upgrade-cycle`.)
+5. **Build.** Run `Workflow` with `phase:"build"` and the refined plan (same `runId`, same `planPath`).
 6. **Verify ground truth YOURSELF** (see below), read `ACCEPTANCE.md`, surface anything in
    `NEEDS-DECISION.md`, and tell the user what to review. **Never commit.**
 
@@ -158,8 +173,9 @@ sequences them. (`upgrade-cycle`'s separate Research role is gone — discovery 
 
 ## Running it — the playbook
 
-1. **Author the plan** (`EnterPlanMode` → `runs/<runId>/PLAN.md`), **run `phase:"refine"` (mandatory,
-   same `runId`)**, fold in its gaps/questions, then `ExitPlanMode` for the user's approval.
+1. **Author the plan** (`EnterPlanMode` → write it into plan mode's `~/.claude/plans/<name>.md`),
+   `ExitPlanMode` for the user's approval, then **copy it to `runs/<runId>/PLAN.md` and run
+   `phase:"refine"` (mandatory, same `runId`)** — fold in its gaps/questions before build.
 2. **`phase:"build"`.** Pass the SAME `runId` you used for refine, plus `target.repo`, `gates`, and
    `planPath` (best — beside the tool, gitignored) **or** inline `plan` text. Reusing the `runId` keeps
    `PLAN.md`, `PLAN-REVIEW.md`, and the build state together under one `runs/<runId>/`.
