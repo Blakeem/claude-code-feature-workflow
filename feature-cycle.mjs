@@ -1,27 +1,21 @@
 export const meta = {
   name: 'feature-cycle',
-  description: 'Plan-driven feature build: implement ONE bounded feature from an approved plan → develop+test → adversarial diff review → triage → verify acceptance, looped per round until done, blocked, or flagged',
-  whenToUse: 'Build ONE bounded, mostly-additive, NON-TRIVIAL feature (~10–100+ LoC: a new MCP tool/API endpoint/page/form, a contained enhancement, a design-needing bugfix) integrated into an existing codebase. NOT for one-line/trivial changes (make those directly — too small for a plan is too small for this) and NOT for breadth-spanning migrations/upgrades/refactors (use upgrade-cycle). The orchestrating agent authors the plan in PLAN MODE (EnterPlanMode → plan mode\'s own ~/.claude/plans/<name>.md file), the user approves it (ExitPlanMode), then the agent runs the MANDATORY phase:"refine" with planPath = that plan-mode file\'s full absolute path (no copy; abs() does not expand ~) — adversarial plan review vs the real repo, run AFTER approval, NOT inside read-only plan mode — folds in the gaps, and runs phase:"build" (reuse the same runId + planPath throughout).',
+  description: 'Plan-driven feature build, lean/file-bus design: implement ONE bounded feature from an approved plan → develop → BLIND pure-code review (must pass) → plan-aware acceptance + regression review (stages on pass), looped per round until done, blocked, or flagged. Agents exchange messages as verbatim files; the harness only routes paths + verdicts.',
+  whenToUse: 'Build ONE bounded, mostly-additive, NON-TRIVIAL feature (~10–100+ LoC: a new MCP tool/API endpoint/page/form, a contained enhancement, a design-needing bugfix) integrated into an existing codebase. NOT for one-line/trivial changes (make those directly) and NOT for breadth-spanning migrations/refactors. The orchestrating agent authors the plan in PLAN MODE (EnterPlanMode → ~/.claude/plans/<name>.md), the user approves (ExitPlanMode), then runs MANDATORY phase:"refine" (planPath = that file\'s absolute path) — adversarial plan review vs the real repo — folds in the gaps, ensures a CLEAN unstaged working tree, then runs phase:"build" (reuse the same runId + planPath throughout).',
   phases: [
-    { title: 'Refine', detail: 'MANDATORY first pass: an independent critic greps the repo, verifies the plan against real code, and flags gaps + blocking questions (refine phase only)' },
-    { title: 'Load', detail: 'Parse the approved plan + read prior progress (resume)' },
-    { title: 'Develop', detail: 'Developer implements the plan minimally, writes/runs tests + any frontend/MCP/curl verification, leaves changes UNSTAGED' },
-    { title: 'Review', detail: 'Adversarial reviewer reads ONLY the unstaged diff + the acceptance criteria — deliberately BLIND to the plan steps, so it judges the code on its own merits' },
-    { title: 'Triage', detail: 'Planner routes findings via the decision matrix, checks for regressions, stages on accept, hard-stops on a blocker' },
-    { title: 'Verify', detail: 'Acceptance check (sees the plan): every criterion satisfied + the feature is wired/reachable + full gates green' },
-    { title: 'Record', detail: 'Scribe persists progress + a human FEATURE summary' },
+    { title: 'Refine', detail: 'MANDATORY first pass (refine phase only): an independent critic greps the repo, verifies the plan against real code, returns gaps + blocking questions to the orchestrating agent. Writes nothing.' },
+    { title: 'Develop', detail: 'Developer reads the approved plan (verbatim) + the latest review that flagged issues; implements minimally, runs the gate to green, leaves changes UNSTAGED. Owns the decision matrix; halts only for a user-only decision.' },
+    { title: 'Quality', detail: 'BLIND pure-code critic: reads ONLY the unstaged diff (no plan, no spec, no goal), flags production-blocking defects, writes quality-review-N.md. Must be clean to proceed.' },
+    { title: 'Acceptance', detail: 'Plan-aware gate: every acceptance criterion met + feature reachable + full gates green + no regression. Writes acceptance-review-N.md; on pass, STAGES the feature (git add, never commit).' },
   ],
 };
 
 // =============================================================================
 // Config — everything app/feature-specific arrives via args so the engine stays general.
-// The PLAN is produced OUTSIDE this engine: the orchestrating agent authors it in PLAN MODE
-// (EnterPlanMode → writes it into plan mode's own ~/.claude/plans/<name>.md) → the user approves
-// (ExitPlanMode, which lifts read-only) → the agent runs phase:"refine" with planPath pointing at
-// that plan-mode file directly (no copy; pass its FULL absolute path — abs() does not expand ~). It
-// is the MANDATORY plan review; it writes, so it CANNOT run inside read-only plan mode → folds in the
-// gaps/answers → phase:"build" implements it, reusing the same runId + planPath. This engine CONSUMES
-// that plan; it does not decompose or discover a goal.
+// The PLAN is produced OUTSIDE this engine, in PLAN MODE, and read VERBATIM from its file by the
+// developer + acceptance verifier (never parsed-and-rebuilt — see WORKFLOW-PRINCIPLES.md #2). The
+// blind quality reviewer is never given the plan path (#3). The main agent ensures a clean unstaged
+// working tree before phase:"build" (#4) — there is no baseline/loader/scribe agent.
 // =============================================================================
 const A = typeof args === 'string' ? JSON.parse(args) : args;
 if (!A || !A.runId || !(A.planPath || (A.plan && typeof A.plan !== 'object'))) {
@@ -31,17 +25,17 @@ if (!A || !A.runId || !(A.planPath || (A.plan && typeof A.plan !== 'object'))) {
 const PHASE       = A.phase ?? 'build';                     // 'refine' (review the plan, stop) | 'build' (implement it)
 const RUN_ID      = A.runId;
 const TARGET      = A.target ?? {};                         // { repo, lang, framework }
-const REFERENCE   = A.reference ?? '';                      // optional: a completed example to diff against
+const REFERENCE   = A.reference ?? '';                      // optional: a completed example to mirror
 const CONVENTIONS = A.conventions ?? '(none supplied — infer from the surrounding code)';
 const GATES       = A.gates ?? {};                          // { build, test, testSetup }
-const MAX_ROUNDS  = A.maxRounds ?? 3;                       // develop→review→triage fix rounds before "needs-attention"
+const GATE        = A.gate ?? 'green';                      // 'green' (build + verification pass) | 'build-only'
+const MAX_ROUNDS  = A.maxRounds ?? 4;                       // develop→quality→acceptance rounds before "needs-attention"
 
-// Per-role model tiers + OPTIONAL custom subagent types. By default no agentType is passed, so
-// every role runs as the harness's standard workflow subagent (always available). Only set an
-// agentType that exists in YOUR agent registry. Scribe work is mechanical (verbatim JSON/markdown
-// writes) — the cheaper tier is deliberate. There is no separate research role: discovery happened
-// in plan mode before this engine ran.
-const M  = { planner: 'opus', develop: 'opus', review: 'sonnet', scribe: 'sonnet', ...(A.models ?? {}) };
+// Per-role model tiers + OPTIONAL custom subagent types. By default no agentType is passed, so every
+// role runs as the harness's standard workflow subagent (always available). Only set an agentType
+// that exists in YOUR registry. Acceptance is opus (spec + regression, high stakes); the blind
+// quality critic is the fast tier (runs every round).
+const M  = { plan: 'opus', develop: 'opus', quality: 'sonnet', acceptance: 'opus', ...(A.models ?? {}) };
 const AT = { ...(A.agentTypes ?? {}) };
 const roleOpts = (role, extra) => ({ model: M[role], ...(AT[role] ? { agentType: AT[role] } : {}), ...extra });
 
@@ -52,191 +46,89 @@ let ROOT = (A.root ? String(A.root) : '').replace(/\\/g, '/').replace(/\/+$/, ''
 if (!ROOT) {
   const loc = await agent(
     'Output ONLY the absolute current working directory: run `pwd` and return its path verbatim, nothing else. Read-only — change nothing.',
-    roleOpts('scribe', { label: 'locate-root',
+    roleOpts('quality', { label: 'locate-root',
       schema: { type: 'object', required: ['cwd'], properties: { cwd: { type: 'string' } } } }),
   );
   ROOT = String(loc?.cwd ?? '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
   log(`root auto-detected: ${ROOT || '(detection failed — falling back to cwd-relative paths)'}`);
 }
-// Normalize EVERY incoming path (Windows backslashes included) BEFORE the absolute-path test —
-// otherwise `E:\foo\bar` fails the test and gets wrongly prefixed with ROOT.
 const norm        = (p) => String(p).replace(/\\/g, '/').replace(/\/+$/, '');
 const abs         = (p) => { const n = norm(p); return (ROOT && !/^([a-zA-Z]:)?\//.test(n)) ? `${ROOT}/${n}` : n; };
 const REFERENCE_P = REFERENCE ? abs(REFERENCE) : '';
 const REPO        = abs(TARGET.repo ?? '.');               // absolute path to the target git repo
 const STATE_DIR   = abs(A.stateDir ?? `runs/${RUN_ID}`);   // <root>/runs/<runId> unless overridden
-// Plan source has a PRECEDENCE: planPath wins; inline `plan` (markdown string) is the fallback. Only
-// one is ever non-empty, so the loader/critic prompts are handed exactly one plan (no ambiguity).
 const PLAN_PATH   = A.planPath ? abs(A.planPath) : '';
 const PLAN_INLINE = (!A.planPath && A.plan && typeof A.plan !== 'object') ? String(A.plan) : '';
+// The plan reference handed to plan-aware agents (developer, acceptance, critic). NEVER handed to the
+// blind quality reviewer.
+const PLAN_REF    = PLAN_PATH ? `the approved plan file at ${PLAN_PATH} (read it verbatim)` : `the approved plan below:\n-----\n${PLAN_INLINE}\n-----`;
 
-// Review surfaces everything >= REVIEW_SEV; the in-loop fix bar (fixSeverity) is applied inside the
-// decision matrix prose, not in JS. Floors default HIGH (lean policy — see MATRIX).
-const SEV_RANK    = { low: 1, medium: 2, high: 3, critical: 4 };
-const REVIEW_SEV  = SEV_RANK[A.reviewSeverity ?? (A.fixSeverity ?? 'high')];
-// Findings in these categories BYPASS the severity floor — the decision matrix routes them (testing
-// blockers and wiring/completeness gaps are ALWAYS triaged, whatever severity the reviewer assigned).
-const FLOOR_EXEMPT = new Set(['testing', 'wiring', 'incomplete']);
-// Agent-driven verification methods that can be legitimately UNAVAILABLE in a headless run
-// environment — eligible for a triage-approved DEFERRAL (unit tests never are).
-const ENV_METHODS  = new Set(['curl', 'chrome-devtools-mcp', 'mcp-inspector', 'playwright', 'manual']);
+const qualityFile    = (r) => `${STATE_DIR}/quality-review-${r}.md`;
+const acceptanceFile = (r) => `${STATE_DIR}/acceptance-review-${r}.md`;
+const NEEDS_USER     = `${STATE_DIR}/NEEDS-USER.md`;   // full detail; for the user (may halt the run)
+const DISMISSED      = `${STATE_DIR}/DISMISSED.md`;    // terse ledger; developer → reviewers (anti-spin)
+// The settled-decisions both reviewers read so they don't re-raise closed findings (but NOT prior
+// review files — that would anchor them; see WORKFLOW-PRINCIPLES.md #5).
+const SETTLED = `Before reviewing, READ these if they exist — they are the settled decisions, so you do
+NOT re-raise what is already closed:
+  • ${DISMISSED} — findings the developer declined, each with a one-line reason.
+  • ${NEEDS_USER} — items already escalated to the user.
+Skip anything listed there FOR THE STATED REASON. Do NOT read prior review files — review the CURRENT
+diff FRESH (so you also catch new or similar nearby issues, and independently re-verify earlier fixes).
+If you are confident a DISMISSED reason is WRONG and the issue is genuinely production-blocking, raise
+it ONCE, prefixed "CONTESTS DISMISSAL:", explaining why the reason does not hold.`;
 
-// Gate semantics for an ADDITIVE feature (no intentionally-red phase — a feature that breaks the
-// existing suite IS a regression, so 'green' means the whole gate passes):
-//   green       -> build passes AND the required verification (unit tests and/or the frontend/MCP/
-//                  curl check named in the test strategy) passes
-//   build-only  -> build passes; no test pass/fail requirement
-// Build (lint/compile) must ALWAYS pass.
-function gateOk(gate, tstrat, dev) {
+// Gate check (additive feature; no intentionally-red phase). 'green' => build passes AND the required
+// verification passes AND the existing suite is not reddened. 'build-only' => build passes. When a
+// feature legitimately has NO verification, the orchestrator passes gate:'build-only'.
+function gateOk(dev) {
   if (!dev) return false;
-  if (GATES.build && dev.build_passed !== true) return false;          // build/lint must always pass
-  if (gate === 'build-only') return true;
-  // A new feature that reddens the EXISTING suite is a regression, regardless of its own verification.
-  if (dev.full_suite_outcome === 'failed') return false;
-  if (!tstrat || tstrat.kind === 'none') return true;                  // green, nothing to verify beyond build
-  // Verification was expected. tests_run_count === 0 means the runner executed NOTHING — a FALSE green
-  // (a unit selector that matched zero tests). Compliant manual/MCP/curl runs report -1 (N/A), which
-  // passes this guard, so we apply it unconditionally regardless of the `unit` flag.
-  if (dev.tests_run_count === 0) return false;
+  if (GATES.build && dev.build_passed !== true) return false;   // build/lint must always pass
+  if (GATE === 'build-only') return true;
+  if (dev.full_suite_outcome === 'failed') return false;        // reddening the suite is a regression
+  if (dev.test_outcome === 'not-run') return false;             // green requires verification to have run
+  if (dev.tests_run_count === 0) return false;                  // selector matched nothing = FALSE green
   return dev.test_outcome === 'passed';
 }
 
 // =============================================================================
-// Structured-output schemas
+// Structured-output schemas — DECISIONS ONLY (control plane). All prose/content lives in files.
 // =============================================================================
-const TEST_STRATEGY_SHAPE = {
-  type: 'object',
-  properties: {
-    kind:    { type: 'string', enum: ['tdd', 'tests-after', 'manual', 'none'], description: 'tdd = write failing tests first then implement to green; tests-after = implement then test; manual = human/agent-driven verification (e.g. frontend); none = build-only' },
-    unit:    { type: 'boolean', description: 'true if automated unit/integration tests are part of the gate for this feature' },
-    method:  { type: 'string', description: 'the verification METHOD: "unit" | "curl" | "chrome-devtools-mcp" | "mcp-inspector" | "playwright" | "manual" | "" — drives how the developer proves the feature works' },
-    details: { type: 'string', description: 'exactly how to run/scope the verification: commands, test selectors, how to start a server, what behavior to assert' },
-  },
-};
-
-// The parsed plan. WHAT (feature, acceptance_criteria, integration_points) is shared with every
-// role. HOW (steps, files, test_strategy) is shown ONLY to the developer + the acceptance verifier
-// — the reviewer and triage stay blind to it so their judgement is not anchored to the plan.
-const PLAN_SHAPE = {
-  type: 'object',
-  required: ['feature', 'acceptance_criteria', 'steps'],
-  properties: {
-    feature:             { type: 'string', description: 'one-paragraph WHAT: the bounded feature and why' },
-    acceptance_criteria: { type: 'array', items: { type: 'string' }, description: 'observable, testable definitions of done' },
-    integration_points:  { type: 'array', items: { type: 'string' }, description: 'where the feature must be WIRED IN / reachable: route mounted, tool registered, export added, DI binding, feature flag, menu entry' },
-    steps:               { type: 'array', items: { type: 'string' }, description: 'ordered, minimal implementation steps (the HOW)' },
-    files:               { type: 'array', items: { type: 'string' }, description: 'likely-touched source paths (repo-relative)' },
-    test_strategy:       TEST_STRATEGY_SHAPE,
-    gate:                { type: 'string', enum: ['green', 'build-only'], description: 'green = build + required verification pass; build-only = build green only' },
-    notes:               { type: 'string' },
-  },
-};
-
-const LOADER_SCHEMA = {
-  type: 'object',
-  required: ['plan', 'done', 'plan_missing'],
-  properties: {
-    plan: PLAN_SHAPE,
-    done: { type: 'object', properties: { status: { type: 'string', description: 'prior progress status, or "" if none' } } },
-    plan_missing: { type: 'boolean', description: 'true if no plan text/file could be read' },
-    plan_review_exists: { type: 'boolean', description: 'true if a PLAN-REVIEW.md (output of the mandatory refine phase) already exists in the state dir' },
-  },
-};
-
 const DEVELOP_SCHEMA = {
   type: 'object',
-  required: ['results', 'build_passed', 'test_outcome', 'full_suite_outcome', 'unstaged_confirmed'],
+  required: ['build_passed', 'test_outcome', 'full_suite_outcome', 'unstaged_confirmed', 'needs_user'],
   properties: {
-    results: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['file', 'status', 'summary'],
-        properties: {
-          file: { type: 'string' },
-          status: { type: 'string', enum: ['CHANGED', 'ADDED', 'SKIPPED', 'FAILED'] },
-          summary: { type: 'string' },
-        },
-      },
-    },
-    tests_written:    { type: 'boolean' },
-    build_passed:     { type: 'boolean' },
-    test_outcome:     { type: 'string', enum: ['passed', 'failed', 'not-run'], description: 'passed = the required verification (unit and/or frontend/MCP/curl) ran and PASSED. failed = it ran and failed. not-run = no verification executed.' },
-    verification_method: { type: 'string', description: 'what was actually run to verify (e.g. "npm test", "curl localhost:3000/health", "chrome-devtools-mcp"); note here if a configured MCP/tool was UNAVAILABLE in this environment' },
-    tests_run_count:  { type: 'integer', description: 'unit/integration tests the runner ACTUALLY executed (0 = selector matched nothing = a FALSE green; -1 = N/A or the runner prints no count, e.g. manual/MCP verification)' },
-    full_suite_outcome: { type: 'string', enum: ['passed', 'failed', 'not-run', 'scoped-skip'], description: 'result of running the FULL test gate to confirm the EXISTING suite is not reddened: passed | failed | not-run (could not run it) | scoped-skip (the test strategy deliberately scopes verification)' },
-    unstaged_confirmed: { type: 'boolean', description: 'true if changes were left UNSTAGED (git add NOT run on content)' },
-    gate_output:      { type: 'string', description: 'tail of failing gate/verification output, or "" if green' },
-    notes:            { type: 'string' },
+    build_passed:      { type: 'boolean' },
+    test_outcome:      { type: 'string', enum: ['passed', 'failed', 'not-run'], description: 'passed = the required verification ran and PASSED; failed = ran and failed; not-run = no verification executed' },
+    tests_run_count:   { type: 'integer', description: 'unit/integration tests the runner ACTUALLY executed (0 = selector matched nothing = a FALSE green; -1 = N/A, e.g. manual/MCP verification)' },
+    full_suite_outcome:{ type: 'string', enum: ['passed', 'failed', 'not-run', 'scoped-skip'], description: 'result of running the FULL test gate to confirm the EXISTING suite is not reddened' },
+    verification_method:{ type: 'string', description: 'what was actually run to verify (e.g. "pytest -q", "curl localhost:3000/health"); note here if a configured MCP/tool was UNAVAILABLE in this environment' },
+    unstaged_confirmed:{ type: 'boolean', description: 'true if all changes were left UNSTAGED (git add NOT run on content; git add -N only, for new files)' },
+    needs_user:        { type: 'boolean', description: 'true ONLY if a HARD blocker / user-only decision stopped you; you wrote a full entry to NEEDS-USER.md and cannot proceed' },
+    dismissed_count:   { type: 'integer', description: 'how many review findings you declined and logged to DISMISSED.md this round (0 if none)' },
+    gate_output:       { type: 'string', description: 'tail of failing gate/verification output, or "" if green' },
   },
 };
 
-const REVIEW_SCHEMA = {
+const QUALITY_SCHEMA = {
   type: 'object',
-  required: ['findings'],
+  required: ['clean', 'issue_count'],
   properties: {
-    findings: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['file', 'category', 'severity', 'title', 'detail', 'introduced_by_this_change', 'business_logic'],
-        properties: {
-          file: { type: 'string' },
-          line: { type: 'string' },
-          category: { type: 'string', enum: ['correctness', 'security', 'error-handling', 'regression', 'api-contract', 'data-integrity', 'types', 'testing', 'wiring', 'incomplete', 'performance', 'maintainability', 'convention'] },
-          severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
-          title: { type: 'string', description: 'short, specific, stable across rounds' },
-          detail: { type: 'string' },
-          introduced_by_this_change: { type: 'boolean', description: 'true if THIS cycle\'s unstaged diff introduced it; false if it pre-exists in the staged/committed baseline' },
-          business_logic: { type: 'boolean', description: 'true if it touches existing domain/business logic whose behavior could regress' },
-          suggested_fix: { type: 'string' },
-        },
-      },
-    },
+    clean:       { type: 'boolean', description: 'true if NO production-blocking defects were found in the unstaged diff' },
+    issue_count: { type: 'integer', description: 'number of production-blocking defects written to the review file' },
   },
 };
 
-const TRIAGE_SCHEMA = {
+const ACCEPTANCE_SCHEMA = {
   type: 'object',
-  required: ['verdicts', 'accepted', 'staged', 'has_blocker'],
+  required: ['pass', 'staged', 'reachable'],
   properties: {
-    verdicts: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['finding_id', 'is_real', 'decision', 'blocking', 'rationale'],
-        properties: {
-          finding_id: { type: 'string' },
-          is_real: { type: 'boolean' },
-          decision: { type: 'string', enum: ['ACTIONABLE', 'DEFER', 'NEEDS_USER', 'REJECT'] },
-          blocking: { type: 'boolean', description: 'true ONLY if this prevents all further progress on the feature' },
-          matrix: {
-            type: 'object',
-            properties: {
-              clarity: { type: 'string', enum: ['clear', 'ambiguous'] },
-              effort: { type: 'string', enum: ['small', 'large'] },
-              blast_radius: { type: 'string', enum: ['local', 'cross-cutting'] },
-              scope: { type: 'string', enum: ['in-scope', 'scope-creep'] },
-              architectural: { type: 'boolean' },
-            },
-          },
-          rationale: { type: 'string' },
-          fix_instruction: { type: 'string', description: 'precise minimal instruction (ACTIONABLE only)' },
-        },
-      },
-    },
-    accepted: { type: 'boolean', description: 'true if the round is accepted (gate met, zero ACTIONABLE) and was staged' },
-    staged: { type: 'boolean', description: 'true if you ran `git add` on the feature files this round' },
-    regression_found: { type: 'boolean', description: 'true if the unstaged diff regressed previously-staged/accepted work' },
-    verification_deferred: { type: 'boolean', description: 'true ONLY when accepting a round whose configured non-unit verification method was UNAVAILABLE in this environment — the verification is deferred to the user/orchestrating agent via NEEDS-DECISION.md' },
-    has_blocker: { type: 'boolean', description: 'true if any verdict.blocking is true; conductor halts the whole run' },
-    next_fix_plan: {
-      type: 'object',
-      properties: { steps: { type: 'array', items: { type: 'string' } }, files: { type: 'array', items: { type: 'string' } } },
-      description: 'develop-plan for the next round (present when accepted=false and not blocked)',
-    },
-    wrote_logs: { type: 'boolean' },
-    summary: { type: 'string' },
+    pass:        { type: 'boolean', description: 'true if every acceptance criterion is met, the feature is reachable, gates are green, and nothing regressed' },
+    staged:      { type: 'boolean', description: 'true if you ran `git add` on the feature files (only on pass; NEVER commit)' },
+    reachable:   { type: 'boolean', description: 'the feature is actually wired in / reachable from the app entry points' },
+    regression:  { type: 'boolean', description: 'true if the unstaged diff regressed previously-staged/committed behavior' },
+    gap_count:   { type: 'integer', description: 'number of unmet criteria / gaps written to the review file (0 on pass)' },
+    suite_result:{ type: 'string', description: 'observed outcome of running the FULL gates' },
   },
 };
 
@@ -244,16 +136,16 @@ const REFINE_SCHEMA = {
   type: 'object',
   required: ['verdict', 'gaps', 'questions'],
   properties: {
-    verdict: { type: 'string', enum: ['ready', 'needs-changes', 'needs-answers'], description: 'ready = plan is sound and complete; needs-changes = material gaps to fix; needs-answers = blocking questions only the user can resolve' },
+    verdict: { type: 'string', enum: ['ready', 'needs-changes', 'needs-answers'], description: 'ready = sound + complete; needs-changes = material gaps; needs-answers = blocking questions only the user can resolve' },
     gaps: {
       type: 'array',
       items: {
         type: 'object',
         required: ['title', 'evidence'],
         properties: {
-          title: { type: 'string' },
-          evidence: { type: 'string', description: 'file:line hits / grep counts proving the gap — no evidence, no gap' },
-          suggestion: { type: 'string', description: 'how to fix the plan: add a step | cover a call site | fix file list | adjust test strategy | split into multiple runs' },
+          title:      { type: 'string' },
+          evidence:   { type: 'string', description: 'file:line hits / grep counts proving the gap — no evidence, no gap' },
+          suggestion: { type: 'string', description: 'how to fix the plan' },
         },
       },
     },
@@ -263,404 +155,158 @@ const REFINE_SCHEMA = {
         type: 'object',
         required: ['question'],
         properties: {
-          question: { type: 'string' },
-          why_blocking: { type: 'string', description: 'why the plan is not safe to build without an answer' },
+          question:    { type: 'string' },
+          why_blocking:{ type: 'string', description: 'why the plan is not safe to build without an answer' },
         },
       },
     },
-    too_big: { type: 'boolean', description: 'true if this is more than ONE bounded feature and should be split across multiple runs (or handed to upgrade-cycle)' },
-    notes: { type: 'string' },
+    too_big: { type: 'boolean', description: 'true if this is more than ONE bounded feature and should be split' },
+    notes:   { type: 'string' },
   },
 };
-
-const VERIFY_SCHEMA = {
-  type: 'object',
-  required: ['complete', 'criteria', 'gaps'],
-  properties: {
-    complete: { type: 'boolean', description: 'true if every acceptance criterion is met, the feature is reachable, and gates are green' },
-    criteria: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['criterion', 'met'],
-        properties: {
-          criterion: { type: 'string' },
-          met: { type: 'boolean' },
-          evidence: { type: 'string', description: 'file:line / test name / observed output proving it' },
-        },
-      },
-    },
-    reachable: { type: 'boolean', description: 'the feature is actually wired in / reachable from the app entry points (every integration point satisfied)' },
-    suite_result: { type: 'string', description: 'observed outcome of running the FULL gates' },
-    verification_result: { type: 'string', description: 'outcome of re-running the configured frontend/MCP/curl/manual verification (or why it could not be run)' },
-    gaps: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['title', 'evidence'],
-        properties: {
-          title: { type: 'string' },
-          evidence: { type: 'string' },
-          suggested_fix: { type: 'string' },
-        },
-      },
-    },
-  },
-};
-
-const BASELINE_SCHEMA = {
-  type: 'object',
-  required: ['clean'],
-  properties: {
-    clean: { type: 'boolean', description: 'true once `git diff` (unstaged tracked) is empty' },
-    staged_files: { type: 'array', items: { type: 'string' } },
-    ignored_untracked: { type: 'array', items: { type: 'string' } },
-    notes: { type: 'string' },
-  },
-};
-
-const RECORD_SCHEMA = { type: 'object', required: ['written'], properties: { written: { type: 'boolean' } } };
 
 // =============================================================================
-// Shared prompt fragments
+// Shared prompt fragment + decision matrix (developer-owned)
 // =============================================================================
-// WHAT — the shared context every role sees: the feature, its acceptance criteria, where it must
-// wire in, the environment, and the staging contract. Deliberately does NOT include the HOW.
-const whatContext = (plan) => `
-FEATURE (the WHAT — the single bounded change this run delivers; do NOT exceed it):
-${plan.feature}
-
-ACCEPTANCE CRITERIA (the observable spec the code must satisfy — "done" means ALL of these hold):
-${(plan.acceptance_criteria || []).map((c, i) => `  ${i + 1}. ${c}`).join('\n') || '  (none specified)'}
-${(plan.integration_points || []).length ? `INTEGRATION POINTS (the feature must be WIRED IN / reachable here — unreached code is an incomplete feature):\n${plan.integration_points.map((p) => `  • ${p}`).join('\n')}` : ''}
-
-TARGET REPO: ${REPO}  (lang=${TARGET.lang ?? '?'}, framework=${TARGET.framework ?? '?'})
-${REFERENCE_P ? `REFERENCE (a COMPLETED example to mirror — mine it for the canonical pattern): ${REFERENCE_P}` : ''}
-
-CONVENTIONS (match these; deviations are 'convention' findings):
-${CONVENTIONS}
-
-GATES (the build/test commands that define "it works"):
+const ENV = `TARGET REPO: ${REPO}  (lang=${TARGET.lang ?? '?'}, framework=${TARGET.framework ?? '?'})
+${REFERENCE_P ? `REFERENCE (a COMPLETED example to mirror): ${REFERENCE_P}\n` : ''}GATES (the commands that define "it works"):
   build: ${GATES.build ?? '(none)'}
-  test:  ${GATES.test ?? '(none)'}
-  ${GATES.testSetup ? `test setup note: ${GATES.testSetup}` : ''}
+  test:  ${GATES.test ?? '(none)'}${GATES.testSetup ? `\n  test setup: ${GATES.testSetup}` : ''}`;
 
-STAGING CONTRACT (the cycle boundary is git itself):
-  • staged index + HEAD  = ACCEPTED baseline (prior blessed work + pre-existing tree). Treat as known-good.
-  • unstaged working tree = THIS feature's work — the only thing under review.
-  • Developers NEVER stage. The Planner stages (git add, NEVER commit) only on acceptance. Nothing is ever committed — the USER commits.
+const MATRIX = `DECISION MATRIX — for each ambiguity or review finding, route it yourself IN ORDER (first match wins):
+  1. Not a real problem / false positive .............. DROP — LOG it (see LOGGING).
+  2. Pre-existing in untouched code (not yours) ....... DROP silently (out of scope; never fix — regression risk).
+  3. Stops the build/tests/verification ............... FIX (always).
+  4. A real, clear, in-scope fix (local, small) ....... FIX.
+  5. Needed to satisfy the spec / wire the feature in . FIX (an unreachable or incomplete feature is not done).
+  6. Conflicts with the plan / intentional / not a real-world code path ... DROP — LOG it (see LOGGING).
+  7. A genuine DESIGN/BUSINESS choice only the USER can make, OR a blocker you cannot resolve in scope
+        .............................................. ESCALATE (see LOGGING).
+  8. Anything else (style, medium/low polish, a different feature) ... DROP silently.
+  • A finding a reviewer RE-RAISED as "CONTESTS DISMISSAL": do NOT re-drop it — FIX it, or if it is
+    truly a user-only call, ESCALATE it. NEVER log the same dismissal twice.
 
-BE TOKEN-ECONOMICAL (target ~150k tokens for your whole turn): read ONLY the files this feature
-touches plus the SPECIFIC reference section you need — do NOT re-read the whole tree. Prefer
-targeted grep over broad reads. Don't restate large files back; act on them.
-`;
-
-// HOW — the implementation plan. Shown ONLY to the developer and the acceptance verifier.
-const howBlock = (plan) => `
-APPROVED IMPLEMENTATION PLAN (the HOW — already reviewed + approved by the user; follow it):
-STEPS:
-${(plan.steps || []).map((s, i) => `  ${i + 1}. ${s}`).join('\n') || '  (none — implement the acceptance criteria minimally)'}
-FILES (likely): ${(plan.files || []).join(', ') || '(discover)'}
-TEST STRATEGY: kind=${plan.test_strategy?.kind ?? 'none'} · method=${plan.test_strategy?.method || '(none)'} · unit=${plan.test_strategy?.unit ?? false}
-  ${plan.test_strategy?.details || '(no extra detail)'}
-GATE: ${plan.gate ?? 'green'}
-${plan.notes ? `PLAN NOTES: ${plan.notes}` : ''}
-`;
-
-const MATRIX = `
-SCOPE DISCIPLINE (this is NOT a general code review — a SEPARATE review workflow does that later):
-Act ONLY on issues THIS change introduced. Make the feature correct, reachable, testable, and
-production-safe, and leave the code we TOUCHED a little better — nothing more. Pre-existing problems
-in untouched code are OUT OF SCOPE: never fix them (regression risk) and don't even log them.
-
-DECISION MATRIX — route each finding IN ORDER (first match wins):
-  1. is_real == false ............................................ REJECT (drop)
-  2. introduced_by_this_change == false (pre-existing) .......... REJECT (out of scope — drop, do NOT log)
-  3. prevents tests/build from running or passing .............. ACTIONABLE (testing blockers are ALWAYS fixed)
-  4. the diff does NOT satisfy an acceptance criterion, OR the
-     feature is not actually wired in / reachable ............... ACTIONABLE (an incomplete feature is not done)
-  5. easy & obvious in-scope fix (clear, local, ≤ a few lines) . ACTIONABLE (take the easy win, any severity)
-  6. introduced regression of previously-staged/accepted work . ACTIONABLE (you raise this yourself)
-  7. severity >= ${A.fixSeverity ?? 'high'} (production-blocking) AND a clear correct in-scope fix ... ACTIONABLE (fix our own breakage)
-  8. severity >= ${A.fixSeverity ?? 'high'} but ambiguous / a business-logic judgment / needs a human call
-        ... NEEDS_USER → ${STATE_DIR}/NEEDS-DECISION.md (FLAG — must be addressed before production).
-            blocking=true ONLY if no further FEATURE progress is possible without the answer.
-  9. scope-creep / a different feature outside this plan ........ REJECT (drop, do NOT log)
- 10. otherwise (medium/low, non-blocking, not an easy win) ..... REJECT — DO NOT log it. The separate
-        code-review workflow will catch it. Conserving context is the priority here.
-NET: fix testing blockers + incomplete-implementation/wiring gaps + easy wins + our own
-production-blocking breakage; FLAG only the major issues that need a human; silently drop everything
-else. Don't chase perfection — that wastes context and rounds.
-`;
+LOGGING — this (plus your code) is your ONLY output. Keep it minimal and unambiguous:
+  • DROP (1 or 6): append ONE terse line to ${DISMISSED} so reviewers won't re-raise it —
+      \`<file:line> — <finding gist> — SKIPPED: <reason, ≤15 words>\`
+  • ESCALATE (7): append a FULL, self-contained entry to ${NEEDS_USER} (as much detail as the user
+    needs to decide). If you CANNOT proceed without the answer, set needs_user=true (the run HALTS).
+    If you can proceed with a defensible default, record it there too but leave needs_user=false.`;
 
 // =============================================================================
-// Role prompts
+// Role prompts — succinct; each agent gets ONE document link for its task.
 // =============================================================================
-const loaderPrompt = () => `
-You are the PLAN LOADER (read-only). Prepare a ${PHASE}-phase run.
-1. Obtain the plan text:
-${PLAN_PATH ? `   • Read the plan file at ${PLAN_PATH}.` : ''}${PLAN_INLINE ? `   • Use this inline plan text:\n-----\n${PLAN_INLINE}\n-----` : ''}
-   If neither yields readable content, set plan_missing=true and return an empty plan.
-2. Parse it into the PLAN schema. The plan is human/agent-authored markdown — extract:
-   • feature (the WHAT, one paragraph), acceptance_criteria[], integration_points[] (where it must
-     wire in / be reachable), steps[] (the HOW), files[], test_strategy{kind,unit,method,details},
-     gate ('green' unless the plan clearly says build-only).
-   • If a field is absent, infer conservatively: gate='green'. If the plan states a test strategy,
-     carry it verbatim; set kind='none' only if the plan EXPLICITLY wants no tests. If the plan has
-     NO test-strategy section at all: ${GATES.test ? `a test gate IS configured, so default to {kind:'tests-after', unit:true, method:'unit', details:'run the configured test gate'}` : `no test gate is configured, so default to kind='none'`}.
-     Do NOT invent steps — if steps are missing, leave steps=[] (the developer will implement the
-     acceptance criteria).
-3. Read ${STATE_DIR}/progress.json if it exists → return its status as done.status (else "").
-4. Check whether ${STATE_DIR}/PLAN-REVIEW.md exists → set plan_review_exists (true/false). This is the
-   artifact the MANDATORY refine phase writes; the conductor uses it to confirm the plan was reviewed.
-Do NOT modify anything. Return via the schema.`;
+const developPrompt = (round, reviewPath) => `
+You are the DEVELOPER. Implement ${PLAN_REF}. Build it minimally and surgically; match conventions;
+NO scope creep beyond the plan.
+${ENV}
+CONVENTIONS: ${CONVENTIONS}
+${round === 1
+  ? `This is round 1: the working tree is clean. Implement the plan from scratch.`
+  : reviewPath
+    ? `A prior review flagged issues — READ ${reviewPath} and resolve exactly those. Your earlier work is
+already in the UNSTAGED working tree: build ON it, do NOT revert or redo it.`
+    : `A prior round's build/verification was not green. Your earlier work is in the UNSTAGED working
+tree — re-run the gate (below), see what is failing, and fix it. Build ON your work; do NOT revert it.`}
+
+PROCEDURE:
+1. Implement the plan's steps. WIRE IT IN so the feature is actually reachable (registered/exported/
+   routed/bound/flagged) — written-but-unreachable is NOT done. Author/extend tests per the plan's
+   Test Strategy.${GATES.testSetup ? ` If the harness is missing: ${GATES.testSetup}.` : ''}
+2. RUN THE GATE until it is GREEN — build: ${GATES.build ?? '(none)'} ; verification: per the plan's
+   Test Strategy (${GATES.test ?? 'no test gate configured'}). Also run the FULL suite to confirm you
+   did not redden it (report full_suite_outcome). Never weaken/delete tests to get green.
+   SANITY-CHECK the runner really executed your unit tests (tests_run_count = 0 means it matched
+   NOTHING = a false green; -1 if N/A, e.g. manual/MCP).
+3. LEAVE EVERYTHING UNSTAGED — do NOT \`git add\` content and do NOT commit. EXCEPTION: for any file
+   you CREATE, run \`git -C ${REPO} add -N <file>\` (intent-to-add, so reviewers' \`git diff\` sees it;
+   it does not stage content). Set unstaged_confirmed=true.
+4. ${MATRIX}
+Return ONLY the decision fields via the schema (no prose report — your code IS the output).`;
+
+// BLIND. No plan, no spec, no goal, no acceptance criteria — judges the code purely as code.
+const qualityPrompt = (round) => `
+You are a CODE CRITIC. You have NO information about what this code is for, what it should do, or any
+plan or spec — and you must not seek any. Judge the code PURELY ON ITS OWN MERITS.
+TARGET REPO: ${REPO}
+
+${SETTLED}
+
+SCOPE — review ONLY this cycle's UNSTAGED work:
+  \`git -C ${REPO} diff\`                    (unstaged tracked changes — review this)
+  \`git -C ${REPO} status --porcelain\` then READ every NEW/untracked file (\`??\`/\`A\`) — \`git diff\` OMITS new files.
+  \`git -C ${REPO} diff --staged\` is the ACCEPTED baseline — context only, do NOT review it.
+
+Report ONLY production-blocking defects INTRODUCED by this diff: real correctness/security/
+data-integrity/error-handling/resource/concurrency/api-contract bugs, or anything that breaks the
+build or tests. DROP silently: anything pre-existing in the baseline, style, naming, medium/low
+polish, speculation, redesigns. An EMPTY result is the normal, GOOD outcome.
+
+WRITE your findings to ${qualityFile(round)} (create ${STATE_DIR}/ if needed): one section per defect
+— file:line, what's wrong, why it's production-blocking, a concrete fix. If none, write exactly
+"No production-blocking defects found." Then return clean (true if none) + issue_count via the schema.
+Do NOT modify source, stage, or commit.`;
+
+const acceptancePrompt = (round) => `
+You are the ACCEPTANCE VERIFIER — the final, plan-aware gate. The blind code review already passed.
+Verify, against the repo itself, that the FEATURE is fully delivered and nothing regressed. Read
+${PLAN_REF}.
+${ENV}
+
+${SETTLED}
+OVERRIDE: ${DISMISSED} entries are the developer's judgment calls. You are plan-aware — if a dismissed
+item ACTUALLY breaks an acceptance criterion, leaves the feature unreachable, or causes a regression,
+that OVERRIDES the dismissal: fail acceptance for it and record it in your review file.
+
+SCOPE — this cycle's work is the UNSTAGED diff plus new files:
+  \`git -C ${REPO} diff\` + \`git -C ${REPO} status --porcelain\` (READ new files).
+  \`git -C ${REPO} diff --staged\` = accepted baseline (compare against it for regressions).
+
+PROCEDURE:
+1. For EACH acceptance criterion, find concrete evidence it holds (a diff hunk, a passing test, an
+   observed behavior). Mark met / not-met with file:line / test-name / output evidence.
+2. REACHABILITY: prove every integration point is satisfied — the feature is registered/exported/
+   routed/bound/flagged and reachable from real entry points (grep to prove it).
+3. REGRESSION: compare the unstaged diff against the staged baseline; confirm no previously-working
+   behavior was changed or broken.
+4. Run the FULL gates once and record the real outcome:
+     build: ${GATES.build ?? '(none)'}    test: ${GATES.test ?? '(none)'}
+   Re-run the plan's configured verification method to confirm the feature behaves as specified. If a
+   configured MCP/tool is unavailable here, say so in the file (do not fake it) and return pass=false.
+5. WRITE ${acceptanceFile(round)} (create ${STATE_DIR}/ if needed): the per-criterion table, the
+   reachability + regression result, the gate output, and each gap (title + file:line + fix) — or
+   "All criteria met; reachable; no regression."
+6. DECIDE:
+   • Everything met, reachable, gates green, no regression → \`git -C ${REPO} add <the feature's changed
+     AND newly-created files>\` (NEVER commit); return pass=true, staged=true.
+   • Otherwise → return pass=false (do NOT stage); the gaps you wrote drive the next develop round.
+Do NOT modify source code. Return ONLY the decision fields via the schema.`;
 
 const refinePrompt = () => `
-You are an INDEPENDENT PLAN CRITIC (read-only). The orchestrating agent authored the feature plan
-below in plan mode. Your ONLY job is to find what it MISSED or got WRONG against the REAL repo —
-not to restyle or re-architect it. An empty result (verdict="ready") is a GOOD outcome.
-${PLAN_PATH ? `PLAN FILE: ${PLAN_PATH} (read it).` : ''}${PLAN_INLINE ? `PLAN:\n-----\n${PLAN_INLINE}\n-----` : ''}
-
-TARGET REPO: ${REPO}  (lang=${TARGET.lang ?? '?'}, framework=${TARGET.framework ?? '?'})
-${REFERENCE_P ? `REFERENCE (a completed example to mirror): ${REFERENCE_P}` : ''}
-GATES: build=${GATES.build ?? '(none)'} · test=${GATES.test ?? '(none)'}
+You are an INDEPENDENT PLAN CRITIC (read-only). The orchestrating agent authored the feature plan in
+plan mode. Find what it MISSED or got WRONG against the REAL repo — not to restyle or re-architect it.
+An empty result (verdict="ready") is a GOOD outcome. Read ${PLAN_REF}.
+${ENV}
 
 PROCEDURE:
-1. Read the plan. Verify its FILE LIST and INTEGRATION POINTS against the actual repo (grep for the
-   symbols/APIs/registries the feature must touch — e.g. where similar features are registered,
-   exported, routed, wired into DI/config). Do NOT trust the plan's lists; confirm them.
-2. Report a GAP only for a MATERIAL miss WITHIN this feature: an unaddressed integration/wiring
-   point, a missing prerequisite, a wrong/absent file, an acceptance criterion with no implementing
-   step, a test strategy that won't actually prove the criteria, or a feature too big for one
-   develop pass (set too_big=true and say where to split).
+1. Verify the plan's FILE LIST and INTEGRATION POINTS against the actual repo (grep for the symbols/
+   registries/routes the feature must touch — confirm them; do not trust the plan's lists).
+2. Report a GAP only for a MATERIAL miss WITHIN this feature: an unaddressed wiring point, a missing
+   prerequisite, a wrong/absent file, an acceptance criterion with no implementing step, a test
+   strategy that won't prove the criteria, or a feature too big for one develop pass (too_big=true).
 3. Raise a QUESTION only for something that genuinely BLOCKS safe implementation and only a human can
-   resolve (an ambiguous contract, an unconfirmed external dependency, a real design choice).
-4. Do NOT report style, alternative designs, or anything beyond this feature. Provide file:line
-   evidence for every gap — no evidence, no gap. Do NOT modify any files.
-Return via the schema (verdict ready/needs-changes/needs-answers).`;
-
-const developPrompt = (plan, repair, fixItems) => {
-  const t = plan.test_strategy ?? { kind: 'none' };
-  const gate = plan.gate ?? 'green';
-  const verifyLine = gate === 'build-only'
-    ? 'build-only — no test pass/fail requirement; just keep the build green.'
-    : t.kind === 'none'
-      ? 'green — keep the build green; no separate verification configured for this feature.'
-      : t.kind === 'tdd'
-        ? `green (TEST-FIRST) — author the tests for the acceptance criteria FIRST (they should fail), then implement until they PASS. Report test_outcome="passed" once green.`
-        : `green — the feature's verification must PASS (test_outcome="passed").`;
-  return `
-You are the DEVELOPER. Implement the APPROVED PLAN below EXACTLY — minimally and surgically. Match
-conventions. NO opportunistic refactors, NO scope creep beyond the plan and acceptance criteria.
-${whatContext(plan)}
-${howBlock(plan)}
-${repair ? `THIS IS A REPAIR ROUND. Address ONLY these items from the prior review/gate failure (do NOT revert your prior good work — build ON it):\n${(fixItems || []).map((s, i) => `  ${i + 1}. ${s}`).join('\n')}` : ''}
-
-PROCEDURE (IPO):
-0. BASELINE: the accepted baseline is already STAGED, so \`git -C ${REPO} diff\` shows only THIS
-   cycle's work: empty on a fresh round 1; on a repair round — or a RESUMED run — it shows your own
-   prior work: build ON it, never revert/redo it. Do not stage anything.
-1. Implement the steps. Author/extend tests as the test strategy requires. If the test harness is
-   missing: ${GATES.testSetup || '(stand up the minimal harness the strategy needs)'}. Leave the
-   lines you TOUCH a little better (obvious one-line wins welcome), but do NOT refactor or fix
-   unrelated/pre-existing code. SELF-REVIEW your own diff before returning and fix anything obviously
-   wrong — catching it here saves a whole review→fix round.
-2. WIRE IT IN: satisfy every INTEGRATION POINT so the feature is actually reachable (registered/
-   exported/routed/bound/flagged), not just written. A feature that exists but isn't reachable is NOT done.
-3. VERIFY (${gate} → ${verifyLine}). Run the gates and the strategy's verification method:
-     build: ${GATES.build ?? '(skip — none configured)'}
-     verification: ${t.method || '(unit/suite)'} — ${t.details || (GATES.test ?? '(skip — none configured)')}
-   • For an ADDITIVE feature, also confirm you did NOT break the existing suite (run the FULL test
-     gate unless the strategy scopes it) — a new feature that reddens the suite is a regression.
-     Report it in full_suite_outcome: passed | failed | not-run (couldn't run it) | scoped-skip (the
-     strategy deliberately scopes verification).
-   • Frontend/MCP/curl methods: drive the named tool (e.g. chrome-devtools-mcp, mcp-inspector) or
-     start the server and curl it, per the strategy details, and observe the real behavior. If the
-     configured tool/MCP is NOT available in this environment, set test_outcome="not-run", explain in
-     verification_method + gate_output, and let triage decide — do NOT fake a pass.
-   Set build_passed; set test_outcome to passed | failed | not-run; record verification_method.
-   SANITY-CHECK the runner REALLY executed your unit tests: set tests_run_count to the count it
-   reports (0 = your selector matched NOTHING = a FALSE green — fix it and re-run; -1 if N/A, e.g.
-   manual/MCP verification). Some runners silently ignore extra path args — when in doubt run one file
-   per invocation or use the runner's filter flag.
-4. Never weaken/delete tests or disable checks to get green. Build/lint must always pass; if you
-   cannot make it pass within scope, leave it failing and explain in gate_output.
-5. LEAVE CONTENT UNSTAGED — do NOT \`git add\` content and do NOT commit. EXCEPTION: for any file you
-   CREATE, run \`git -C ${REPO} add -N <file>\` (intent-to-add) so it shows up in the reviewer's
-   \`git diff\` (which otherwise omits brand-new files). Intent-to-add does not stage content. Set
-   unstaged_confirmed=true.
-Report per-file status + gate results via the schema.`;
-};
-
-// The reviewer is deliberately BLIND to the plan's steps/files/test-strategy. It judges the diff
-// against the acceptance criteria alone, so it catches what the PLAN itself got wrong — and it
-// can't be anchored into rubber-stamping "the code matches the plan".
-const reviewPrompt = (plan, handled) => `
-You are the ADVERSARIAL REVIEWER. Review ONLY this cycle's work — the UNSTAGED diff — for
-production-readiness, judged against the ACCEPTANCE CRITERIA. You are deliberately NOT shown the
-implementation plan: assess the code ON ITS OWN MERITS, not whether it "followed a plan". The
-staged/committed baseline is KNOWN-GOOD context — read it for intent, but do NOT review it.
-${whatContext(plan)}
-
-SCOPE — get the exact diff first:
-  \`git -C ${REPO} diff\`            (unstaged tracked changes = part of THIS cycle — review this)
-  \`git -C ${REPO} status --porcelain\` then READ every NEW/untracked file (\`??\`/\`A\`) of this feature —
-       \`git diff\` OMITS brand-new files, so new test/source files only show up here.
-  \`git -C ${REPO} diff --staged\`  (accepted baseline — context only, do NOT review)
-THIS CYCLE = the unstaged tracked diff PLUS those new files. Ignore unrelated pre-existing baseline.
-
-This is NOT a general code review — a SEPARATE workflow audits the whole codebase later. Your ONLY
-job: did THIS change introduce a problem, or fail to actually deliver the feature? Report ONLY:
-  • TESTING BLOCKERS — anything that stops the build/tests/verification from running or passing.
-  • INCOMPLETE FEATURE — the diff does NOT satisfy an acceptance criterion, OR the feature is not
-    actually wired in / reachable (an integration point left unconnected). Report as incomplete/high.
-  • INTRODUCED PRODUCTION-BLOCKING defects (severity >= ${A.reviewSeverity ?? 'high'}): a real
-    correctness/security/data-integrity/api-contract bug or a REGRESSION this diff caused.
-  • (optional) a genuinely OBVIOUS one-line in-scope improvement to a line THIS diff touched.
-Do NOT report — drop silently — anything pre-existing, medium/low, stylistic, speculative, a
-redesign, or outside this feature. An empty findings list is the NORMAL, GOOD outcome. For each
-finding set introduced_by_this_change (must be TRUE) and business_logic, with a specific file:line.
-Do NOT re-report ALREADY HANDLED items:
-${handled.length ? handled.map((t) => `  - ${t}`).join('\n') : '  (none yet)'}
-Return via the schema (usually an empty array).`;
-
-// Triage is also blind to the plan's HOW — it routes findings by the matrix against the WHAT.
-const triagePrompt = (plan, items, round, gateMet, gateDesc, gateOutput, isLastRound, deferrable) => `
-You are the PLANNER in TRIAGE mode — and the orchestrator-of-record for the git baseline. Confirm
-each finding against the ACTUAL unstaged diff, route it via the decision matrix, and either ACCEPT
-(stage) the round or produce the next fix-plan. Reject false positives and scope creep ruthlessly.
-You are NOT shown the implementation plan — judge scope against the acceptance criteria.
-${whatContext(plan)}
-ROUND ${round} of max ${MAX_ROUNDS}.
-GATE: ${gateDesc}
-GATE OUTCOME: ${gateMet ? 'MET — the gate expectation is satisfied' : 'NOT MET — see detail:'}
-${gateMet ? '' : (gateOutput || '(no detail)')}
-${deferrable ? `VERIFICATION UNAVAILABLE IN THIS ENVIRONMENT: the build is green and the existing suite is not
-reddened, but the configured verification method could not run here (test_outcome="not-run"). You
-MAY accept this round with verification DEFERRED if the code is otherwise clean: set
-verification_deferred=true, append a "Deferred verification" entry to ${STATE_DIR}/NEEDS-DECISION.md
-stating EXACTLY what must be verified manually, then stage and set accepted=true. If the method
-SHOULD have worked here (a wrong command, a server that failed to start, fixable setup), do NOT
-defer — return a fix-plan instead.
-` : ''}
-CANDIDATE FINDINGS (finding_id :: file :: category/severity :: introduced/business :: title):
-${items.length ? items.map((i) => `  - ${i.id} :: ${i.f.file} :: ${i.f.category}/${i.f.severity} :: introduced=${i.f.introduced_by_this_change} business=${i.f.business_logic} :: ${i.f.title}\n      ${i.f.detail}\n      suggested: ${i.f.suggested_fix || '(none)'}`).join('\n') : '  (none — reviewer returned clean)'}
-${MATRIX}
-
-PROCEDURE:
-1. Verify each finding against \`git -C ${REPO} diff\`. Route via the matrix. For ACTIONABLE items
-   write a precise minimal fix_instruction.
-2. REGRESSION CHECK: compare the unstaged diff against the staged baseline
-   (\`git -C ${REPO} diff --staged\`). If this cycle regressed previously-accepted behavior, raise
-   it yourself as an ACTIONABLE finding (set regression_found=true).
-3. DOCUMENT — keep this MINIMAL to conserve context (create headers if missing):
-     • NEEDS_USER → append to ${STATE_DIR}/NEEDS-DECISION.md (title, where, what, options, recommendation).
-     • any blocking=true → ALSO append a consolidated entry to ${STATE_DIR}/BLOCKERS.md.
-     • REJECT / dropped items → write NOTHING (mediums, lows, pre-existing, scope-creep are the
-       separate code-review workflow's job). Set wrote_logs=true only if you appended NEEDS_USER/blocker.
-4. DECIDE (THIS IS THE FINAL ALLOWED ROUND: ${isLastRound ? 'YES' : 'no'}):
-   • GATE MET and ZERO ACTIONABLE: ACCEPT — run \`git -C ${REPO} add <the feature's changed AND
-     newly-created files>\` (NEVER commit), set staged=true & accepted=true.
-   • LAST-ROUND + GATE MET with only minor ACTIONABLE easy-wins left: ACCEPT ANYWAY — stage and DROP
-     the leftovers silently. Only REFUSE if a remaining item is a HIGH/CRITICAL introduced must-fix,
-     an incomplete-feature/wiring gap, or a testing blocker.
-   • Otherwise (gate NOT met, or a real must-fix remains, not blocked): accepted=false; return a tight
-     next_fix_plan (steps+files) addressing ONLY the gate problem + must-fix ACTIONABLE items. Leave
-     the tree UNSTAGED.
-   • If any verdict.blocking is true: set has_blocker=true (conductor halts); do NOT stage. Leave the
-     working tree intact for the user.
-Return everything via the schema.`;
-
-// Lean accept — the common happy path (clean review + gate met). Regression spot-check + stage on
-// the cheaper review tier; the full planner triage is wasted when there is nothing to triage.
-const acceptPrompt = (plan, round, gateDesc) => `
-You are finalizing an ACCEPT: the reviewer found NOTHING and the gate expectation is met. Two jobs —
-regression spot-check, then stage.
-${whatContext(plan)}
-ROUND ${round}.  GATE: ${gateDesc}
-1. REGRESSION SPOT-CHECK: \`git -C ${REPO} diff --stat\` (this cycle) vs
-   \`git -C ${REPO} diff --staged --stat\` (accepted baseline). Confirm the unstaged changes
-   plausibly belong to THIS feature and did not clobber previously-staged work. If something looks
-   regressed, return accepted=false, regression_found=true, and a tight next_fix_plan instead.
-2. STAGE: \`git -C ${REPO} add <the feature's changed AND newly-created files>\` (NEVER commit), then
-   confirm \`git -C ${REPO} diff\` is empty for those files.
-Return verdicts=[], accepted=true, staged=true, has_blocker=false via the schema.`;
-
-// Acceptance verifier — sees the FULL plan. The single whole-feature completeness check the per-
-// round loop (which only ever sees its own diff) cannot do. Read-only except writing ACCEPTANCE.md.
-const verifyPrompt = (plan) => `
-You are the ACCEPTANCE VERIFIER. The feature's work is STAGED. Verify, against the repo itself, that
-the FEATURE is actually fully delivered — every acceptance criterion met, the feature reachable, and
-the gates green. Your job is to find what the implementation MISSED, not to re-review accepted style.
-${whatContext(plan)}
-${howBlock(plan)}
-
-PROCEDURE (read-only except step 4):
-1. For EACH acceptance criterion, find concrete evidence it holds (a diff hunk, a passing test, an
-   observed behavior). Mark met=true/false with file:line / test-name / output evidence.
-2. REACHABILITY: confirm every integration point is satisfied — the feature is registered/exported/
-   routed/bound/flagged and reachable from the app's real entry points (grep to prove it). An
-   unreachable feature is incomplete.
-3. Run the FULL gates once and record the real outcome:
-     build: ${GATES.build ?? '(none configured)'}
-     test:  ${GATES.test ?? '(none configured)'}
-   Then RE-RUN the configured verification method (${plan.test_strategy?.method || 'unit/suite'}:
-   ${plan.test_strategy?.details || 'the test gate'}) to confirm the feature behaves as specified.
-   If a configured MCP/tool is unavailable here, say so in verification_result (do not fake it).
-4. Write ${STATE_DIR}/ACCEPTANCE.md: the suite + verification results, the per-criterion table, and
-   each remaining gap (title + file:line evidence + suggested fix) — or "All criteria met." Do NOT
-   modify source code, stage, or commit.
-Report ONLY material, in-feature gaps. Return via the schema.`;
-
-const baselinePrompt = () => `
-You are establishing the git BASELINE for this run in ${REPO}. The staging contract is: staged index
-= ACCEPTED baseline, unstaged working tree = the current cycle's work. Right now the tree may carry
-PRE-EXISTING local changes that belong to NO task and must not pollute the feature's review diff.
-1. Run \`git -C ${REPO} status --porcelain\`.
-2. For every MODIFIED or otherwise-tracked-changed file, run \`git -C ${REPO} add\` on it to fold it
-   into the accepted baseline. Do NOT commit. Afterwards \`git -C ${REPO} diff\` must be EMPTY.
-3. Leave UNTRACKED files untouched — just list them in ignored_untracked.
-4. Write ${STATE_DIR}/progress.json (create the directory if needed) with EXACTLY:
-   {"id":"${RUN_ID}","status":"in-progress"}
-   This marks the run as STARTED so a killed-and-resumed run skips baseline prep instead of folding
-   this feature's in-progress work into the accepted baseline.
-${A.baselineNote ? `Expected pre-existing changes (normal — stage them as baseline, do not revert): ${A.baselineNote}` : ''}
-Do NOT modify any source code. Return the lists + clean=true via the schema.`;
-
-const recorderPrompt = (record, verify) => `
-You are the SCRIBE/RECORDER. Persist this feature's outcome durably so a re-run resumes without
-redoing it. Do NOT modify source code.
-1. Ensure ${STATE_DIR}/ exists.
-2. Write this EXACT JSON verbatim to ${STATE_DIR}/progress.json:
-${JSON.stringify(record)}
-3. Append/refresh a human-readable ${STATE_DIR}/FEATURE.md: the feature, what changed (files, tests
-   added, how it was verified), status, rounds, anything flagged to NEEDS-DECISION, and — if an
-   acceptance check ran — its result and any gaps:
-   ${verify ? JSON.stringify({ complete: verify.complete === true, gaps: (verify.gaps || []).map((g) => g.title), suite: verify.suite_result || '', verification: verify.verification_result || '' }) : '(acceptance check not run)'}
-Return written=true.`;
-
-const writePlanReviewPrompt = (critique) => `
-You are the SCRIBE. Persist the plan critic's findings for the user + orchestrating agent to act on.
-1. Ensure ${STATE_DIR}/ exists.
-2. Write ${STATE_DIR}/PLAN-REVIEW.md: verdict=${critique.verdict}; a "Gaps" section (each title +
-   evidence + suggestion) and a "Questions for you" section (each question + why it blocks). If both
-   are empty, write "Plan looks sound — no gaps or blocking questions." ${critique.too_big ? 'NOTE: the critic judged this is MORE THAN ONE bounded feature — recommend splitting across runs.' : ''}
-Write this verbatim data:
-${JSON.stringify({ verdict: critique.verdict, gaps: critique.gaps || [], questions: critique.questions || [], too_big: critique.too_big === true, notes: critique.notes || '' })}
-Do NOT modify source code. Return written=true.`;
+   resolve. Provide file:line evidence for every gap — no evidence, no gap.
+Do NOT modify any files. Return your findings via the schema (the orchestrating agent acts on them).`;
 
 // =============================================================================
-// PHASE: refine — adversarially review the supplied plan, write PLAN-REVIEW.md, STOP for the user
+// PHASE: refine — adversarially review the plan; return gaps/questions to the orchestrator. STOP.
+// (Writes nothing — the orchestrator reads the return value and relays to the user. Principle #6.)
 // =============================================================================
 if (PHASE === 'refine') {
   phase('Refine');
   log(`refine: critiquing the plan${PLAN_PATH ? ` at ${PLAN_PATH}` : ' (inline)'} against ${REPO}`);
-  // The one-shot plan critique is the highest-leverage call in this phase — run it on the planner tier.
-  const critique = await agent(refinePrompt(), roleOpts('planner', {
+  const critique = await agent(refinePrompt(), roleOpts('plan', {
     schema: REFINE_SCHEMA, phase: 'Refine', label: 'plan-critic',
-  }));
-  await agent(writePlanReviewPrompt(critique || { verdict: 'ready', gaps: [], questions: [] }), roleOpts('scribe', {
-    schema: RECORD_SCHEMA, phase: 'Refine', label: 'record:plan-review',
   }));
   const gaps = critique?.gaps || [];
   const questions = critique?.questions || [];
@@ -672,220 +318,116 @@ if (PHASE === 'refine') {
     tooBig: critique?.too_big === true,
     gaps,
     questions,
-    planReviewFile: `${STATE_DIR}/PLAN-REVIEW.md`,
+    notes: critique?.notes || '',
     nextStep: questions.length
-      ? 'Relay the questions to the user (AskUserQuestion), fold the answers + gap fixes directly into the plan file (planPath), then re-invoke phase:"build" with this SAME runId + planPath. (The user already approved via ExitPlanMode before this refine ran; just flag any material changes.)'
+      ? 'Relay the questions to the user (AskUserQuestion), fold the answers + gap fixes directly into the plan file (planPath), ensure a CLEAN unstaged working tree, then run phase:"build" with this SAME runId + planPath.'
       : gaps.length
-        ? 'Fold the gap fixes directly into the plan file (planPath) (flag any material change to the user), then re-invoke phase:"build" with this SAME runId + planPath.'
-        : 'Plan is sound — re-invoke phase:"build" with this SAME runId + planPath.',
+        ? 'Fold the gap fixes directly into the plan file (planPath), ensure a CLEAN unstaged working tree, then run phase:"build" with this SAME runId + planPath.'
+        : 'Plan is sound — ensure a CLEAN unstaged working tree, then run phase:"build" with this SAME runId + planPath.',
   };
 }
 
 // =============================================================================
-// PHASE: build — implement ONE feature via the develop → review → triage loop, then verify
+// PHASE: build — develop → BLIND quality review (must pass) → acceptance + regression (stages on pass)
+// PRECONDITION (orchestrator's job, #4): the target repo has a CLEAN unstaged working tree. The engine
+// spawns NO baseline/loader/scribe agent; the numbered review files are the only state + progress trail.
 // =============================================================================
-phase('Load');
-const loaded = await agent(loaderPrompt(), roleOpts('scribe', {
-  schema: LOADER_SCHEMA, phase: 'Load', label: 'load-plan',
-}));
-if (loaded?.plan_missing || !loaded?.plan || !(loaded.plan.acceptance_criteria || []).length) {
-  throw new Error(`No usable plan (need feature + acceptance_criteria) from ${PLAN_PATH || 'inline plan'}. Author/approve a plan first.`);
-}
-const plan = loaded.plan;
-const priorStatus = String(loaded?.done?.status ?? '');
-if (priorStatus.startsWith('done')) {
-  log(`resume: feature already ${priorStatus} — nothing to do (delete ${STATE_DIR}/progress.json to force a re-run)`);
-  return { phase: 'build', runId: RUN_ID, alreadyDone: true, status: priorStatus, stateDir: STATE_DIR };
-}
+log(`build: implementing the approved plan → ${REPO} [gate=${GATE}, maxRounds=${MAX_ROUNDS}]`);
 
-const tstrat = plan.test_strategy ?? { kind: 'none' };
-const gate = plan.gate ?? 'green';
-log(`build: "${plan.feature.slice(0, 80)}${plan.feature.length > 80 ? '…' : ''}" → ${REPO} [gate=${gate}, verify=${tstrat.method || tstrat.kind}]`);
-
-// The refine phase is MANDATORY and leaves PLAN-REVIEW.md in the state dir. On a FRESH run (no prior
-// progress) with no such artifact, the plan was very likely built without the required review — warn
-// loudly (non-blocking; resumes keep the artifact, and an inline-plan caller may have reviewed it out
-// of band). Run phase:"refine" with this SAME runId first to satisfy it.
-if (!priorStatus && loaded?.plan_review_exists !== true) {
-  log(`  ⚠ no PLAN-REVIEW.md in ${STATE_DIR} — the MANDATORY refine pass appears to have been skipped. Run phase:"refine" with this same runId BEFORE build (see CLAUDE.md → canonical flow).`);
-}
-
-// One-time baseline prep: fold any pre-existing modified TRACKED files into the staged baseline so
-// the feature's UNSTAGED diff is purely this feature's work (keeps the reviewer's git-diff clean).
-// SKIPPED when a prior progress.json exists (priorStatus non-empty): on a resumed / blocked /
-// needs-attention run the unstaged tree is this feature's IN-PROGRESS work — folding it into the
-// baseline would hide it from review. The baseline agent writes an "in-progress" marker for this.
-if (A.prepBaseline !== false && !priorStatus) {
-  const base = await agent(baselinePrompt(), roleOpts('scribe', {
-    schema: BASELINE_SCHEMA, phase: 'Load', label: 'baseline-prep',
-  }));
-  log(`baseline: staged ${(base?.staged_files || []).length} pre-existing file(s); ignoring ${(base?.ignored_untracked || []).length} untracked`);
-} else if (A.prepBaseline !== false) {
-  log(`baseline: prep skipped — prior run state "${priorStatus}" exists, so the unstaged tree is this feature's in-progress work (delete ${STATE_DIR}/progress.json to force a fresh run + baseline)`);
-}
-
-const record = { id: RUN_ID, feature: plan.feature.slice(0, 120), status: 'pending', rounds: 0, fixed: 0, testWorkRounds: 0, deferred: 0, needsUser: 0, rejected: 0, regression: false, staged: false, verifyDeferred: false, gates: null };
-const handled = [];            // titles fed back to the reviewer so it won't re-report
-const resolved = new Set();    // finding signatures (file:title) considered done
-let halted = false;
-let blockerReason = '';
 let accepted = false;
-
-// ---- DEVELOP → REVIEW → TRIAGE loop -----------------------------------------
+let halted = false;
+let haltReason = '';
 let round = 0;
-let repair = false;
-let fixItems = [];
+let reviewPath = '';            // the latest review file the developer must address (control: a path only)
+let lastAcceptance = null;
+let qualityRounds = 0;
+
 while (round < MAX_ROUNDS) {
   round++;
-  record.rounds = round;
 
+  // ---- DEVELOP -------------------------------------------------------------
   phase('Develop');
-  const dev = await agent(developPrompt(plan, repair, fixItems), roleOpts('develop', {
+  const dev = await agent(developPrompt(round, reviewPath), roleOpts('develop', {
     schema: DEVELOP_SCHEMA, phase: 'Develop', label: `develop r${round}`,
   }));
-  const gateMet = gateOk(gate, tstrat, dev);
-  const gateDesc = `${gate} via ${tstrat.method || tstrat.kind || 'build'} — observed: build=${dev?.build_passed}, test_outcome=${dev?.test_outcome}, count=${dev?.tests_run_count}, suite=${dev?.full_suite_outcome}`;
-  // Environmental deferral candidacy: the configured agent-driven verification (browser MCP /
-  // inspector / curl / manual) could not run in THIS environment, but the build is green and the
-  // existing suite is not reddened. Unit tests are NEVER deferrable.
-  const deferrable = !gateMet && dev?.build_passed === true && dev?.test_outcome === 'not-run'
-    && tstrat.unit !== true && ENV_METHODS.has(tstrat.method || '') && dev?.full_suite_outcome !== 'failed';
-  if (dev?.tests_written) record.testWorkRounds++;
-  record.gates = { gate, met: gateMet, build: dev?.build_passed ?? null, test_outcome: dev?.test_outcome ?? null, method: dev?.verification_method ?? '' };
 
-  // Review the unstaged diff — skipped when the developer produced no changes.
-  const produced = (dev?.results || []).some((r) => r.status === 'CHANGED' || r.status === 'ADDED');
-  if (produced && dev?.unstaged_confirmed !== true) log(`  ⚠ r${round}: developer did not confirm content was left unstaged — staging contract may be violated`);
-  let review = null;
-  if (produced) {
-    phase('Review');
-    review = await agent(reviewPrompt(plan, handled), roleOpts('review', {
-      schema: REVIEW_SCHEMA, phase: 'Review', label: `review r${round}`,
-    }));
-  } else {
-    log(`  review skipped r${round}: developer reported no changed/added files`);
-  }
-  const findings = (review?.findings || [])
-    .filter((f) => FLOOR_EXEMPT.has(f.category) || (SEV_RANK[f.severity] ?? 1) >= REVIEW_SEV)
-    .map((f, i) => ({ id: `r${round}-${i}`, f }))
-    .filter((x) => !resolved.has(`${x.f.file}:${x.f.title}`));
-
-  phase('Triage');
-  const isLastRound = round >= MAX_ROUNDS;
-  // Happy path (clean review + gate met): a LEAN accept on the cheaper review tier. Findings or a
-  // missed gate get the full planner triage.
-  const lean = findings.length === 0 && gateMet && produced;
-  const triage = lean
-    ? await agent(acceptPrompt(plan, round, gateDesc), roleOpts('review', {
-        schema: TRIAGE_SCHEMA, phase: 'Triage', label: `accept r${round}`,
-      }))
-    : await agent(triagePrompt(plan, findings, round, gateMet, gateDesc, dev?.gate_output || '', isLastRound, deferrable), roleOpts('planner', {
-        schema: TRIAGE_SCHEMA, phase: 'Triage', label: `triage r${round}`,
-      }));
-  if (triage?.regression_found) record.regression = true;
-
-  // Tally + remember terminal routings so the reviewer won't resurface them.
-  const byId = new Map(findings.map((x) => [x.id, x]));
-  const actionable = [];
-  for (const v of triage?.verdicts || []) {
-    const item = byId.get(v.finding_id);
-    if (v.decision === 'ACTIONABLE') { actionable.push(v); continue; }
-    if (item) { resolved.add(`${item.f.file}:${item.f.title}`); handled.push(item.f.title); }
-    if (v.decision === 'DEFER') record.deferred++;
-    else if (v.decision === 'NEEDS_USER') record.needsUser++;
-    else if (v.decision === 'REJECT') record.rejected++;
-  }
-
-  // Hard stop on a true blocker — halt the run for user input.
-  if (triage?.has_blocker || (triage?.verdicts || []).some((v) => v.blocking)) {
+  if (dev?.needs_user === true) {
     halted = true;
-    blockerReason = triage?.summary || `Blocker raised during round ${round}.`;
-    record.status = 'BLOCKED';
-    log(`  ✋ BLOCKER during r${round} → halting (see ${STATE_DIR}/BLOCKERS.md)`);
+    haltReason = `Developer halted for a user-only decision in round ${round} (see ${NEEDS_USER}).`;
+    log(`  ✋ r${round}: developer escalated a user-only decision → halting (see ${NEEDS_USER})`);
     break;
   }
-
-  // Accept: the Planner (or lean-accept) is authoritative — but require the gate to be met, OR an
-  // explicit triage-approved deferral of an environmentally-unavailable verification method.
-  const deferredAccept = deferrable && triage?.verification_deferred === true;
-  if (triage?.accepted === true && (gateMet || deferredAccept)) {
-    accepted = true;
-    record.staged = triage?.staged === true;
-    record.verifyDeferred = deferredAccept;
-    record.status = deferredAccept
-      ? 'done (verification deferred — run the configured check yourself; see NEEDS-DECISION.md)'
-      : (record.deferred + record.needsUser > 0) ? 'done (with follow-ups)' : 'done';
-    log(`  ✓ accepted after ${round} round(s) [gate=${gate} ${gateMet ? 'met' : 'DEFERRED — verification unavailable here'}] (staged=${record.staged}, fixed=${record.fixed}, flagged=${record.needsUser})`);
-    break;
+  if (dev?.unstaged_confirmed !== true) {
+    log(`  ⚠ r${round}: developer did not confirm work was left UNSTAGED — staging contract may be violated`);
+  }
+  if (dev?.dismissed_count) {
+    log(`  r${round}: developer declined ${dev.dismissed_count} finding(s) → ${DISMISSED} (audit these at the end)`);
+  }
+  if (!gateOk(dev)) {
+    // Build/verification not green and no user escalation: give the developer another fresh round to
+    // fix it (it re-runs the gate and sees the failure live). No content is carried by the harness.
+    reviewPath = '';
+    if (round >= MAX_ROUNDS) { log(`  ⚠ r${round}: gate still not green at round budget`); break; }
+    log(`  ↻ r${round}: gate not green (build=${dev?.build_passed}, test=${dev?.test_outcome}, suite=${dev?.full_suite_outcome}) → another develop round`);
+    continue;
   }
 
-  // Not accepted → next round from the triage's fix-plan.
-  record.fixed += actionable.length;
-  if (isLastRound) {
-    record.status = gateMet ? 'needs-attention (unresolved must-fix)' : 'needs-attention (gate unmet)';
-    log(`  ⚠ round budget (${MAX_ROUNDS}) exhausted — ${actionable.length} item(s) open, gate(${gate}) ${gateMet ? 'met' : 'UNMET'}`);
-    break;
-  }
-  fixItems = (triage?.next_fix_plan?.steps || []).length
-    ? triage.next_fix_plan.steps
-    : actionable.map((v) => v.fix_instruction).filter(Boolean);
-  // Never hand the developer an EMPTY repair brief — fall back to the gate/triage detail.
-  if (!fixItems.length) {
-    fixItems = [gateMet
-      ? `Triage did not accept the round: ${triage?.summary || '(no detail given)'} — resolve and re-verify.`
-      : `The gate was NOT met (${gateDesc}).${dev?.gate_output ? ` Failing output tail: ${dev.gate_output}` : ''} Diagnose and make the configured verification pass.`];
-  }
-  if (triage?.next_fix_plan?.files?.length) plan.files = triage.next_fix_plan.files;
-  repair = true;
-  log(`  ↻ r${round}: ${actionable.length} actionable + gate(${gate}) ${gateMet ? 'met' : 'UNMET'} → repair round`);
-}
-if (record.status === 'pending') record.status = 'needs-attention (loop end)';
-
-// ---- VERIFY (acceptance) — only when accepted; the whole-feature completeness check -------------
-let verify = null;
-if (accepted && !halted && A.verify !== false) {
-  phase('Verify');
-  verify = await agent(verifyPrompt(plan), roleOpts('review', {
-    schema: VERIFY_SCHEMA, phase: 'Verify', label: 'acceptance',
+  // ---- QUALITY REVIEW (blind, must pass before acceptance) -----------------
+  phase('Quality');
+  qualityRounds++;
+  const quality = await agent(qualityPrompt(round), roleOpts('quality', {
+    schema: QUALITY_SCHEMA, phase: 'Quality', label: `quality r${round}`,
   }));
-  // Acceptance gaps are ADVISORY (like the sibling engine's final sweep): the per-round loop already
-  // accepted + STAGED valid, gate-passing work, so the status stays done-prefixed (a re-run would see
-  // the staged work and not target these gaps — closing them needs a human/agent decision or a follow-
-  // up plan). We surface them LOUDLY here, in the result, and in ACCEPTANCE.md so they are never silent.
-  if (verify && verify.complete !== true) {
-    record.status = `${record.status} (acceptance gaps — see ACCEPTANCE.md)`;
-    log(`  ⚠ verify: ${(verify?.gaps || []).length} gap(s) / unmet criteria — STAGED but NOT fully done; read ${STATE_DIR}/ACCEPTANCE.md`);
-  } else {
-    log(`  ✓ verify: all criteria met (suite: ${verify?.suite_result || 'n/a'})`);
+  if (quality?.clean !== true) {
+    reviewPath = qualityFile(round);
+    if (round >= MAX_ROUNDS) { log(`  ⚠ r${round}: ${quality?.issue_count ?? '?'} quality issue(s) open at round budget (see ${reviewPath})`); break; }
+    log(`  ↻ r${round}: quality review found ${quality?.issue_count ?? '?'} issue(s) → develop addresses ${reviewPath}`);
+    continue;
   }
-}
+  log(`  ✓ r${round}: quality review clean`);
 
-// ---- RECORD (durable; survives kill/resume) -------------------------------------------------
-phase('Record');
-const rec = await agent(recorderPrompt(record, verify), roleOpts('scribe', {
-  schema: RECORD_SCHEMA, phase: 'Record', label: 'record:progress',
-}));
-record.recorded = rec?.written === true;
+  // ---- ACCEPTANCE REVIEW (plan-aware; stages on pass) ----------------------
+  phase('Acceptance');
+  const acc = await agent(acceptancePrompt(round), roleOpts('acceptance', {
+    schema: ACCEPTANCE_SCHEMA, phase: 'Acceptance', label: `acceptance r${round}`,
+  }));
+  lastAcceptance = acc;
+  if (acc?.pass === true) {
+    accepted = true;
+    log(`  ✓ r${round}: acceptance PASSED — feature ${acc?.staged ? 'STAGED' : 'NOT staged (⚠ verifier did not stage)'} (reachable=${acc?.reachable}, suite=${acc?.suite_result || 'n/a'})`);
+    break;
+  }
+  reviewPath = acceptanceFile(round);
+  if (round >= MAX_ROUNDS) { log(`  ⚠ r${round}: acceptance found ${acc?.gap_count ?? '?'} gap(s) at round budget (see ${reviewPath})`); break; }
+  log(`  ↻ r${round}: acceptance found ${acc?.gap_count ?? '?'} gap(s)${acc?.regression ? ' [REGRESSION]' : ''} → develop addresses ${reviewPath}`);
+}
 
 // =============================================================================
 // Result
 // =============================================================================
+const status = halted
+  ? 'BLOCKED (needs user input)'
+  : accepted
+    ? (lastAcceptance?.staged ? 'done (staged)' : 'done (NOT staged — verifier did not stage; check manually)')
+    : 'needs-attention (round budget exhausted)';
+
+log(`build: ${status} after ${round} round(s) [${qualityRounds} quality pass(es)]`);
+
 return {
   phase: 'build',
   runId: RUN_ID,
+  status,
+  accepted,
   halted,
-  blockerReason: halted ? blockerReason : '',
+  staged: accepted && lastAcceptance?.staged === true,
+  reachable: lastAcceptance?.reachable === true,
+  regression: lastAcceptance?.regression === true,
+  rounds: round,
   stateDir: STATE_DIR,
-  status: record.status,
-  staged: record.staged,
-  rounds: record.rounds,
-  fixed: record.fixed,
-  testWorkRounds: record.testWorkRounds,
-  needsUser: record.needsUser,
-  regression: record.regression,
-  verificationDeferred: record.verifyDeferred === true,
-  acceptance: verify ? { complete: verify.complete === true, reachable: verify.reachable === true, gaps: (verify.gaps || []).length, suite: verify.suite_result || '', verification: verify.verification_result || '' } : null,
+  reviewTrail: `Numbered review files in ${STATE_DIR}/ (quality-review-N.md, acceptance-review-N.md) show every iteration.`,
   followups: halted
-    ? `Run halted — see ${STATE_DIR}/BLOCKERS.md. Resolve the root cause, then resume with the same args.`
-    : `${record.verifyDeferred ? `VERIFICATION DEFERRED — the configured ${tstrat.method || 'manual'} check could not run in the workflow environment: run it yourself (see ${STATE_DIR}/NEEDS-DECISION.md) before committing. ` : ''}Review the staged diff in ${REPO} (git diff --cached), ${STATE_DIR}/FEATURE.md, ${STATE_DIR}/NEEDS-DECISION.md${verify && verify.complete !== true ? `, and ${STATE_DIR}/ACCEPTANCE.md (gaps!)` : ''}. Nothing is committed — you commit.`,
+    ? `Run halted for a user decision — read ${NEEDS_USER}, resolve it with the user, ensure the tree is still this feature's in-progress work, then re-invoke phase:"build" with the same args.`
+    : accepted
+      ? `Review the staged diff in ${REPO} (git diff --cached), the numbered review files in ${STATE_DIR}/, and ${DISMISSED} (every finding the developer declined — audit these). Nothing is committed — you commit.`
+      : `Not accepted within ${MAX_ROUNDS} rounds. Read the latest acceptance-review / quality-review file + ${DISMISSED} in ${STATE_DIR}/, decide with the user, then re-invoke phase:"build".`,
 };
