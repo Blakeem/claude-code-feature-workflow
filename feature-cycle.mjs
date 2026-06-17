@@ -21,6 +21,11 @@ const A = typeof args === 'string' ? JSON.parse(args) : args;
 if (!A || !A.runId || !(A.planPath || (A.plan && typeof A.plan !== 'object'))) {
   throw new Error('args must include at least { runId, planPath | plan (markdown string), target, gates }; got typeof=' + (typeof args));
 }
+// `root` is REQUIRED setup the main agent supplies (#4 — no in-engine "find my cwd" agent). It is the
+// absolute path the run-state dir hangs off, normally the workflow tool's own directory.
+if (!A.root) {
+  throw new Error('args.root is required: pass the ABSOLUTE path the run-state should hang off (normally this workflow tool\'s own directory). The engine no longer spawns an agent to auto-detect it.');
+}
 
 const PHASE       = A.phase ?? 'build';                     // 'refine' (review the plan, stop) | 'build' (implement it)
 const RUN_ID      = A.runId;
@@ -39,19 +44,10 @@ const M  = { plan: 'opus', develop: 'opus', quality: 'sonnet', acceptance: 'opus
 const AT = { ...(A.agentTypes ?? {}) };
 const roleOpts = (role, extra) => ({ model: M[role], ...(AT[role] ? { agentType: AT[role] } : {}), ...extra });
 
-// Resolve ROOT to an ABSOLUTE path so every agent + `git -C` call is cwd-independent. Priority:
-//   1. explicit args.root  →  2. AUTO-DETECT the working directory at runtime.
-// Run-state lands in `<ROOT>/runs/<runId>` unless args.stateDir overrides it.
-let ROOT = (A.root ? String(A.root) : '').replace(/\\/g, '/').replace(/\/+$/, '');
-if (!ROOT) {
-  const loc = await agent(
-    'Output ONLY the absolute current working directory: run `pwd` and return its path verbatim, nothing else. Read-only — change nothing.',
-    roleOpts('quality', { label: 'locate-root',
-      schema: { type: 'object', required: ['cwd'], properties: { cwd: { type: 'string' } } } }),
-  );
-  ROOT = String(loc?.cwd ?? '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
-  log(`root auto-detected: ${ROOT || '(detection failed — falling back to cwd-relative paths)'}`);
-}
+// ROOT is the ABSOLUTE base that run-state hangs off (supplied by the main agent — see the required
+// check above), so every agent + `git -C` call is cwd-independent. Run-state lands in
+// `<ROOT>/runs/<runId>` unless args.stateDir overrides it.
+const ROOT        = String(A.root).replace(/\\/g, '/').replace(/\/+$/, '');
 const norm        = (p) => String(p).replace(/\\/g, '/').replace(/\/+$/, '');
 const abs         = (p) => { const n = norm(p); return (ROOT && !/^([a-zA-Z]:)?\//.test(n)) ? `${ROOT}/${n}` : n; };
 const REFERENCE_P = REFERENCE ? abs(REFERENCE) : '';
@@ -116,6 +112,7 @@ const QUALITY_SCHEMA = {
   properties: {
     clean:       { type: 'boolean', description: 'true if NO production-blocking defects were found in the unstaged diff' },
     issue_count: { type: 'integer', description: 'number of production-blocking defects written to the review file' },
+    contested_dismissals: { type: 'integer', description: 'how many DISMISSED.md entries you re-raised as "CONTESTS DISMISSAL:" this round because the stated reason is wrong for a genuine production-blocking defect (0 if none)' },
   },
 };
 
@@ -208,6 +205,9 @@ ${round === 1
 already in the UNSTAGED working tree: build ON it, do NOT revert or redo it.`
     : `A prior round's build/verification was not green. Your earlier work is in the UNSTAGED working
 tree — re-run the gate (below), see what is failing, and fix it. Build ON your work; do NOT revert it.`}
+${round === 1 ? '' : `If ${DISMISSED} exists, READ it first — it is YOUR running ledger of declined findings: do not
+duplicate an entry. If the review you are addressing RE-RAISES one as \`CONTESTS DISMISSAL:\`, you MUST
+FIX or ESCALATE it (never silently re-add the same dismissal).`}
 
 PROCEDURE:
 1. Implement the plan's steps. WIRE IT IN so the feature is actually reachable (registered/exported/
@@ -244,8 +244,8 @@ polish, speculation, redesigns. An EMPTY result is the normal, GOOD outcome.
 
 WRITE your findings to ${qualityFile(round)} (create ${STATE_DIR}/ if needed): one section per defect
 — file:line, what's wrong, why it's production-blocking, a concrete fix. If none, write exactly
-"No production-blocking defects found." Then return clean (true if none) + issue_count via the schema.
-Do NOT modify source, stage, or commit.`;
+"No production-blocking defects found." Then return clean (true if NO findings, including no contests)
++ issue_count + contested_dismissals via the schema. Do NOT modify source, stage, or commit.`;
 
 const acceptancePrompt = (round) => `
 You are the ACCEPTANCE VERIFIER — the final, plan-aware gate. The blind code review already passed.
@@ -341,6 +341,7 @@ let round = 0;
 let reviewPath = '';            // the latest review file the developer must address (control: a path only)
 let lastAcceptance = null;
 let qualityRounds = 0;
+let contestedTotal = 0;         // dismissals a reviewer pushed back on — a spin/disagreement signal for the user
 
 while (round < MAX_ROUNDS) {
   round++;
@@ -378,6 +379,10 @@ while (round < MAX_ROUNDS) {
   const quality = await agent(qualityPrompt(round), roleOpts('quality', {
     schema: QUALITY_SCHEMA, phase: 'Quality', label: `quality r${round}`,
   }));
+  if (quality?.contested_dismissals) {
+    contestedTotal += quality.contested_dismissals;
+    log(`  ⚠ r${round}: quality CONTESTED ${quality.contested_dismissals} dismissal(s) — developer must fix or escalate, not re-dismiss (audit ${DISMISSED})`);
+  }
   if (quality?.clean !== true) {
     reviewPath = qualityFile(round);
     if (round >= MAX_ROUNDS) { log(`  ⚠ r${round}: ${quality?.issue_count ?? '?'} quality issue(s) open at round budget (see ${reviewPath})`); break; }
@@ -423,6 +428,7 @@ return {
   reachable: lastAcceptance?.reachable === true,
   regression: lastAcceptance?.regression === true,
   rounds: round,
+  contestedDismissals: contestedTotal,
   stateDir: STATE_DIR,
   reviewTrail: `Numbered review files in ${STATE_DIR}/ (quality-review-N.md, acceptance-review-N.md) show every iteration.`,
   followups: halted

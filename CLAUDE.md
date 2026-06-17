@@ -79,6 +79,9 @@ Before `phase:"build"`:
 - **Pass `gate`.** Derive it from the plan's `## Gate` section: `green` (build + the required
   verification must pass) or `build-only` (build/lint only — use this when the feature legitimately
   has no test/verification). Default is `green`.
+- **Pass `root` — it's REQUIRED** (both phases). It's the absolute base the run-state hangs off;
+  normally the workflow tool's own directory (so `runs/` lands beside the tool, not in the target
+  repo). The engine no longer spawns an agent to auto-detect the cwd (#4) — omit `root` and it errors.
 
 ## The division of labour that makes this work
 
@@ -239,8 +242,9 @@ To force a totally fresh run, clear `runs/<runId>/` and start from a clean tree.
 - **Rising `dismissed_count` across rounds = the developer is declining a lot.** Read `DISMISSED.md`
   during/after the run; a wrongly-dismissed real defect should have been contested — if you disagree
   with a dismissal, that's a fix or a decision for the user.
-- **Stray `runs/` inside the target repo** = `root` auto-detected to a cwd you didn't expect. Pass
-  `root` explicitly (the tool's own directory), relocate the state, re-run.
+- **Stray `runs/` inside the target repo** = you passed a `root` (or `stateDir`) pointing into the
+  target repo. Pass `root` = the tool's own directory so state lands beside the tool; relocate the
+  stray state, re-run. (`root` is required — the engine errors if it's missing rather than guessing.)
 - **Too big?** If `refine` returns `too_big:true`, or you realize mid-plan the work is really several
   features, split it: run this engine once per bounded feature, or hand the whole thing to
   `upgrade-cycle`.

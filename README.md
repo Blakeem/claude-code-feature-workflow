@@ -175,7 +175,7 @@ couldn't run in the workflow environment, run it yourself first. When satisfied:
 | `target` | ✓ | `{ repo, lang, framework }` — `repo` is the target git repo |
 | `gates` | ✓ | `{ build, test, testSetup }` — your stack's commands |
 | `gate` |  | `"green"` (build + the required verification pass) or `"build-only"` (build/lint only — for a feature with no test/verification). Derive it from the plan's `## Gate` section. Default `"green"`. |
-| `root` |  | where state is written + base for relative paths; auto-detected from cwd if omitted |
+| `root` | ✓ | absolute base the run-state hangs off (normally the workflow tool's own directory, so `runs/` lands beside the tool). Required — the engine errors if it's missing rather than spawning an agent to guess the cwd. |
 | `stateDir` |  | override the `runs/<runId>/` location |
 | `reference` |  | a completed example to mirror |
 | `conventions` |  | coding rules the **developer** follows (the blind reviewer is not shown them) |
