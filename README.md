@@ -42,10 +42,16 @@ for a feature **big enough to deserve a written plan**:
 
 ## How to use it
 
-Ask Claude, and include the word **"workflow"** (that's the opt-in that activates it):
+Clone the repo (it lands in a folder named `claude-code-feature-workflow`; the engine is the single
+file `feature-cycle.mjs`, nothing to build). Then **point Claude at that folder** and ask for a
+feature. Phrasing it as "use the workflow" is the opt-in that lets Claude run the orchestration:
 
-> "Use the feature-cycle **workflow** in `~/tools/feature-cycle` to add a `search_docs` MCP tool to
-> `~/work/my-server`. Plan it first."
+> "Use the feature-cycle **workflow** in `path/to/claude-code-feature-workflow` to add a `search_docs`
+> MCP tool to `~/work/my-server`. Plan it first."
+
+Claude finds `feature-cycle.mjs` in that folder and runs it **by path**. There's no global registry,
+so the folder pointer is how it's discovered. (Optional: drop `feature-cycle.mjs` into a
+`~/.claude/workflows/` directory to invoke it by name instead of by path.)
 
 From there Claude drives everything:
 

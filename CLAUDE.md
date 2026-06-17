@@ -30,7 +30,11 @@ edit or to `upgrade-cycle` instead of forcing it through here.
 
 ## The canonical flow (memorize this — it is the whole job)
 
-All the user needs to say is *what to build* + *where this workflow lives*. Pick a `runId` now and
+All the user needs to say is *what to build* + *where this workflow lives* (the cloned
+`claude-code-feature-workflow` folder). The engine is NOT in any name registry, so every `Workflow`
+call below loads it BY PATH: pass `scriptPath` = the absolute path to `feature-cycle.mjs` in that
+folder, alongside the phase args (`phase`/`runId`/`planPath`/`root`/…). (If the user installed it into
+a `~/.claude/workflows/` dir, you may instead pass `name:"feature-cycle"`.) Pick a `runId` now and
 reuse it for every phase. Then drive, in order:
 
 1. **`EnterPlanMode`.** Plan mode is READ-ONLY and gives you a plan-file path in its system message
