@@ -5,8 +5,9 @@ This repo is a **single self-contained Claude Code Workflow** (`feature-cycle.mj
 design-needing bugfix — from a plan **you (the orchestrating agent) author and the user approves**,
 driving it to a production-ready, test-green, *wired-in* state across one target git repo.
 
-> **Design law:** this engine is built to the rules in **`WORKFLOW-PRINCIPLES.md`** (lean, file-bus,
-> no busy-work agents). Read that file before changing the engine — every choice below follows from it.
+> **Design law:** this engine is built to a strict set of workflow principles (lean, file-bus, no
+> busy-work agents); the `#N` markers below refer to them. Follow those principles before changing the
+> engine — every choice below follows from them.
 
 ## Scope — is this the right tool? (check FIRST)
 
